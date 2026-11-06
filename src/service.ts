@@ -7,6 +7,7 @@ const CREDENTIAL_ENDPOINT = "/api/credential"
 const CONSOLE_USAGE_ENDPOINT = "/api/usage/summary"
 const MICRO_CENTS_PER_DOLLAR = 100_000_000
 const REQUEST_TIMEOUT_MS = 5_000
+const ACTIVITY_CONCURRENCY = 4
 
 type JsonObject = Record<string, unknown>
 
@@ -44,6 +45,33 @@ export type StatsData = {
   today: PeriodStats
   week: PeriodStats
   month: PeriodStats
+}
+
+export type ActivityDay = {
+  date: string
+  day: number
+  cost: number
+  requests: number
+  tokens: number
+}
+
+export type ActivityForecast = {
+  spent: number
+  perDay: number
+  projected: number
+}
+
+export type ActivityData = {
+  month: string
+  label: string
+  daysInMonth: number
+  today: number
+  days: ActivityDay[]
+  forecast: {
+    cost: ActivityForecast
+    requests: ActivityForecast
+    tokens: ActivityForecast
+  }
 }
 
 type ConsoleCredential = {
@@ -111,6 +139,79 @@ export async function fetchStats(
     fetchConsoleSummary(credential, queries.month),
   ])
   return { today, week, month }
+}
+
+export async function fetchActivity(
+  config: ServiceConfig,
+  now = Date.now(),
+): Promise<ActivityData> {
+  const credential = await fetchConsoleCredential(config)
+  const today = new Date(now).getUTCDate()
+  const dates: string[] = []
+  for (let day = 1; day <= today; day++) {
+    dates.push(utcMonthDay(now, day))
+  }
+
+  const summaries = await mapLimit(dates, ACTIVITY_CONCURRENCY, (date) =>
+    fetchConsoleSummary(credential, { from: date, to: date }),
+  )
+
+  const days: ActivityDay[] = dates.map((date, index) => {
+    const stats = summaries[index] ?? { cost: 0, requests: 0, tokens: 0 }
+    return {
+      date,
+      day: index + 1,
+      cost: stats.cost,
+      requests: stats.requests,
+      tokens: stats.tokens,
+    }
+  })
+
+  const pristine = days.length
+  const metric = (pick: (day: ActivityDay) => number): ActivityForecast => {
+    let spent = 0
+    for (const day of days) spent += pick(day)
+    const perDay = pristine > 0 ? spent / pristine : 0
+    return { spent, perDay, projected: perDay * daysInUtcMonth(now) }
+  }
+
+  return {
+    month: utcDate(now).slice(0, 7),
+    label: monthLabel(now),
+    daysInMonth: daysInUtcMonth(now),
+    today,
+    days,
+    forecast: {
+      cost: metric((day) => day.cost),
+      requests: metric((day) => day.requests),
+      tokens: metric((day) => day.tokens),
+    },
+  }
+}
+
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = next
+      next += 1
+      if (index >= items.length) return
+      results[index] = await fn(items[index] as T, index)
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(Math.max(1, limit), items.length) },
+    () => worker(),
+  )
+  await Promise.all(workers)
+  return results
 }
 
 function consoleUsageQueries(now: number): {
@@ -523,6 +624,25 @@ function invalidResponse(
 
 function utcDate(now: number): string {
   return new Date(now).toISOString().slice(0, 10)
+}
+
+function utcMonthDay(now: number, day: number): string {
+  const date = new Date(now)
+  return utcDate(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), day))
+}
+
+function daysInUtcMonth(now: number): number {
+  const date = new Date(now)
+  return new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0),
+  ).getUTCDate()
+}
+
+function monthLabel(now: number): string {
+  return new Date(now).toLocaleDateString("en-US", {
+    month: "long",
+    timeZone: "UTC",
+  })
 }
 
 function startOfUtcWeek(now: number): string {

@@ -88,6 +88,19 @@ export function formatTokens(value: number): string {
   return formatCount(value)
 }
 
+export type Metric = "cost" | "requests" | "tokens"
+
+export function formatMetricValue(value: number, metric: Metric): string {
+  switch (metric) {
+    case "cost":
+      return formatCost(value)
+    case "requests":
+      return formatCount(value)
+    case "tokens":
+      return formatTokens(value)
+  }
+}
+
 export function formatAgo(ms: number): string {
   const elapsed = Math.max(0, ms)
   if (elapsed < 1000) return "just now"

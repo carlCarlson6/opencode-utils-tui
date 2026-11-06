@@ -11,7 +11,8 @@ It shows the three allowance windows — 5-hour (rolling), weekly, and monthly �
 - `LIMITED` state when a window is exhausted
 
 Below the allowance meters, a usage summary shows Console cost, requests, and
-tokens for today, this week, and this month.
+tokens for today, this week, and this month, and an activity graph at the bottom
+charts this month's daily consumption and forecasts the rest of the month.
 
 ```text
 ◆ OpenCode Go · carl's stuff                                            updated 2s ago
@@ -31,8 +32,21 @@ tokens for today, this week, and this month.
 │ Tokens                          137.4m                    238.1m                    512.6m     │
 ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
 
-r refresh   o console   q quit                                                    60s auto-refresh
+╭─ Activity · November · $11.62 spent · $58.11 forecast ────────────────────────────────────────╮
+│   █                                                                                          │
+│   █ █                                                                                        │
+│  █ ███░░░░░░░░░░░░░░░░░░░░░░░░░░                                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────╯
+
+r refresh   m cost   g graph   o console   q quit                                60s auto-refresh
 ```
+
+The activity graph mirrors the Console's Activity tab: solid bars are the days
+elapsed so far this month, the hatched bars are the forecast for the remaining
+days, and the title shows the month-to-date total and the projected month-end
+total. Press `m` to chart cost, requests, or tokens. The graph needs at least a
+26-row terminal; on shorter terminals it is hidden and the rest of the dashboard
+is unchanged.
 
 ## Requirements
 
@@ -67,6 +81,8 @@ bun run build
 | Key | Action |
 | --- | --- |
 | `r` | Refresh now |
+| `m` | Cycle the activity graph metric (cost → requests → tokens) |
+| `g` | Show or hide the activity graph |
 | `o` | Open the OpenCode Console usage page |
 | `q` | Quit |
 
@@ -94,9 +110,11 @@ x-org-id: <workspace ID>
 ```
 
 It is called three times — for today, this week, and this month — and supplies
-the same cost, request, and token totals shown in the Console. The Console
-credential is only ever sent to `opencode.ai`. The local service is discovered
-from:
+the same cost, request, and token totals shown in the Console. To build the
+activity graph it is called once more per elapsed day of the current month
+(`from=<day>&to=<day>`, a few at a time), giving the per-day cost, request, and
+token totals behind the chart. The Console credential is only ever sent to
+`opencode.ai`. The local service is discovered from:
 
 ```text
 $XDG_STATE_HOME/opencode/service.json
@@ -137,11 +155,16 @@ The service URL must be `localhost`, `127.0.0.1`, or `::1`; the app refuses to s
 - Ticks countdowns and the “updated” indicator every second.
 - On a failed fetch, keeps the last good data and retries after 10 seconds.
 - If the usage summary fails but the allowance meters work, the meters stay
-  visible and the summary is marked `stale` or `unavailable`.
+  visible and the summary is marked `stale` or `unavailable`. The activity graph
+  fails independently and keeps its last good data the same way.
 - When a reset time passes, shows `Resetting…` and checks again shortly.
 - If the service is down, shows an actionable error instead of starting or restarting it.
+- The forecast projects month-to-date usage forward at the current daily average
+  (`spent / days elapsed × days in month`), matching the direction of the
+  Console's Activity forecast.
 - At 80x24 all three allowance cards stay in one row, with the usage table
-  below. Below 80x24, a resize warning is shown.
+  below; the activity graph is hidden until the terminal is at least 26 rows
+  tall. Below 80x24, a resize warning is shown.
 
 ## Troubleshooting
 
@@ -187,7 +210,8 @@ If that does not help, check your network connection to `opencode.ai`.
 - The endpoints are experimental/internal. They are isolated in `src/service.ts`, so a future OpenCode API change only needs a fix there.
 - The allowance limits endpoint exposes percentages only. Cost, requests, and tokens come from the Console usage API.
 - The usage summary matches the Console’s **Activity → My usage** figures for the active workspace and user.
-- “Today” is the Console’s Today range. The week starts Monday (UTC) and the month starts on the 1st (UTC), matching the Console’s date buckets.
+- “Today” is the Console’s Today range. The week starts Monday (UTC) and the month starts on the 1st (UTC), matching the Console’s date buckets. The activity graph uses the same UTC day and month buckets.
+- The activity graph issues one Console summary request per elapsed day to derive the daily series, so later in the month it makes more requests than the summary does. The forecast is a straight-line projection at the month-to-date average pace, not the Console’s own model.
 - The app reads the active Console credential from the local OpenCode service and sends it only to `opencode.ai`.
 - The “monthly” allowance window is a roughly 30-day cycle, not the calendar month.
 - Only the active workspace and Console user are shown.
@@ -197,9 +221,9 @@ If that does not help, check your network connection to `opencode.ai`.
 ## Manual checks
 
 1. `bun run typecheck`
-2. `bun run start` — verify data, colors, countdowns, reset times, and the usage summary.
-3. Press `r`, `o`, and `q`.
-4. Resize to 80x24, 100x30, and 120x40.
+2. `bun run start` — verify data, colors, countdowns, reset times, the activity graph, and the usage summary.
+3. Press `r`, `m` (cost → requests → tokens), `g` (hide/show the graph), `o`, and `q`.
+4. Resize to 80x24 (graph hidden), 100x30 (graph shown), and 120x40.
 5. Simulate a service failure without touching the real service:
 
    ```bash

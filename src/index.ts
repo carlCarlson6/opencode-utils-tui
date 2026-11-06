@@ -1,6 +1,7 @@
 import { createCliRenderer, type CliRenderer } from "@opentui/core"
 import { createDashboard, type DashboardState } from "./dashboard"
 import {
+  fetchActivity,
   fetchStats,
   fetchUsage,
   loadServiceConfig,
@@ -64,8 +65,12 @@ async function main(): Promise<void> {
   let state: DashboardState = {
     data: null,
     stats: null,
+    activity: null,
     error: null,
     statsError: null,
+    activityError: null,
+    metric: "cost",
+    showActivity: true,
     lastUpdated: null,
     loading: true,
     nextRefreshAt: Date.now(),
@@ -115,9 +120,10 @@ async function main(): Promise<void> {
 
     try {
       const config = await loadServiceConfig()
-      const [usageResult, statsResult] = await Promise.allSettled([
+      const [usageResult, statsResult, activityResult] = await Promise.allSettled([
         fetchUsage(config),
         fetchStats(config),
+        fetchActivity(config),
       ])
       const now = Date.now()
       const stats =
@@ -126,12 +132,22 @@ async function main(): Promise<void> {
         statsResult.status === "rejected"
           ? toUsageError(statsResult.reason)
           : null
+      const activity =
+        activityResult.status === "fulfilled"
+          ? activityResult.value
+          : state.activity
+      const activityError =
+        activityResult.status === "rejected"
+          ? toUsageError(activityResult.reason)
+          : null
 
       if (usageResult.status === "rejected") {
         state = {
           ...state,
           stats,
           statsError,
+          activity,
+          activityError,
           error: toUsageError(usageResult.reason),
           loading: false,
           nextRefreshAt: now + ERROR_RETRY_MS,
@@ -139,10 +155,13 @@ async function main(): Promise<void> {
       } else {
         const data = usageResult.value
         state = {
+          ...state,
           data,
           stats,
+          activity,
           error: null,
           statsError,
+          activityError,
           lastUpdated: now,
           loading: false,
           nextRefreshAt: now + REFRESH_INTERVAL_MS,
@@ -214,6 +233,16 @@ async function main(): Promise<void> {
       requestRefresh()
       return
     }
+    if (name === "g") {
+      state = { ...state, showActivity: !state.showActivity }
+      render()
+      return
+    }
+    if (name === "m") {
+      state = { ...state, metric: nextMetric(state.metric) }
+      render()
+      return
+    }
     if (name === "o") {
       openConsole()
     }
@@ -230,6 +259,12 @@ async function main(): Promise<void> {
   void refresh()
 }
 
+function nextMetric(metric: DashboardState["metric"]): DashboardState["metric"] {
+  if (metric === "cost") return "requests"
+  if (metric === "requests") return "tokens"
+  return "cost"
+}
+
 function printHelp(): void {
   console.log(`oc-usage ${VERSION}
 
@@ -244,6 +279,8 @@ Options:
 
 Keys:
   r  Refresh now
+  g  Toggle the activity / forecast graph
+  m  Cycle the graph metric (cost, requests, tokens)
   o  Open OpenCode Console
   q  Quit
 

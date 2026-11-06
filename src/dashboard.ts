@@ -17,6 +17,7 @@ import {
   formatCost,
   formatCount,
   formatDuration,
+  formatMetricValue,
   formatPercent,
   formatResetClock,
   formatShort,
@@ -25,9 +26,11 @@ import {
   remainingPercent,
   renderBar,
   truncateText,
+  type Metric,
 } from "./format"
 import { layout, theme } from "./theme"
 import type {
+  ActivityData,
   Meter,
   PeriodStats,
   StatsData,
@@ -38,8 +41,12 @@ import type {
 export type DashboardState = {
   data: UsageData | null
   stats: StatsData | null
+  activity: ActivityData | null
   error: UsageError | null
   statsError: UsageError | null
+  activityError: UsageError | null
+  metric: Metric
+  showActivity: boolean
   lastUpdated: number | null
   loading: boolean
   nextRefreshAt: number
@@ -63,6 +70,16 @@ type StatsPanel = {
   setWidth(width: number): void
 }
 
+type ActivityPanel = {
+  box: BoxRenderable
+  update(
+    activity: ActivityData | null,
+    error: UsageError | null,
+    metric: Metric,
+  ): void
+  setWidth(width: number): void
+}
+
 type Overlay = {
   show(
     title: string,
@@ -78,14 +95,19 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
   let currentState: DashboardState = {
     data: null,
     stats: null,
+    activity: null,
     error: null,
     statsError: null,
+    activityError: null,
+    metric: "cost",
+    showActivity: true,
     lastUpdated: null,
     loading: true,
     nextRefreshAt: Date.now(),
   }
   let currentWidth = renderer.width
   let currentHeight = renderer.height
+  let activityAttached = false
 
   const root = new BoxRenderable(renderer, {
     id: "dashboard",
@@ -154,6 +176,7 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
   for (const card of cards) cardsRow.add(card.box)
 
   const statsPanel = createStatsPanel(renderer)
+  const activityPanel = createActivityPanel(renderer)
   cardsArea.add(statsPanel.box)
   root.add(cardsArea)
 
@@ -208,12 +231,22 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
 
     for (const card of cards) card.setWidth(cardWidth)
     statsPanel.setWidth(contentWidth)
+    activityPanel.setWidth(contentWidth)
     renderState()
   }
 
   function renderState(): void {
     const state = currentState
     const now = Date.now()
+
+    const showActivity =
+      state.showActivity && currentHeight >= layout.minHeightForActivity
+    if (showActivity !== activityAttached) {
+      if (showActivity) cardsArea.add(activityPanel.box)
+      else cardsArea.remove(activityPanel.box)
+      activityAttached = showActivity
+    }
+
     const data = state.data
     const error = state.error
     const limited = data
@@ -247,6 +280,7 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
     cards[2]?.update(data?.go.monthly ?? null, now)
 
     statsPanel.update(state.stats, state.statsError)
+    activityPanel.update(state.activity, state.activityError, state.metric)
 
     const retrying = error !== null && !state.loading
     const canOpen = Boolean(data?.workspace.usageURL)
@@ -256,6 +290,14 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
       fg(theme.accent)(bold("r")),
       isRetry ? " retry" : " refresh",
     ]
+    if (showActivity) {
+      keyParts.push(
+        "   ",
+        fg(theme.accent)(bold("m")),
+        ` ${state.metric}`,
+      )
+    }
+    keyParts.push("   ", fg(theme.accent)(bold("g")), " graph")
     if (canOpen) {
       keyParts.push("   ", fg(theme.accent)(bold("o")), " console")
     }
@@ -547,6 +589,155 @@ function createStatsPanel(renderer: CliRenderer): StatsPanel {
     update(stats, error) {
       currentStats = stats
       currentError = error
+      render()
+    },
+    setWidth(width) {
+      panelWidth = Math.max(0, width)
+      render()
+    },
+  }
+}
+
+function createActivityPanel(renderer: CliRenderer): ActivityPanel {
+  let panelWidth = 78
+  let activity: ActivityData | null = null
+  let error: UsageError | null = null
+  let metric: Metric = "cost"
+
+  const box = new BoxRenderable(renderer, {
+    id: "activity",
+    height: layout.activityHeight,
+    flexShrink: 0,
+    flexDirection: "column",
+    border: true,
+    borderStyle: "rounded",
+    borderColor: theme.cardBorder,
+    title: " Activity ",
+    titleColor: theme.dim,
+    titleAlignment: "left",
+    backgroundColor: theme.card,
+    paddingLeft: 1,
+    paddingRight: 1,
+  })
+
+  const chartRows = Array.from(
+    { length: layout.activityChartHeight },
+    () =>
+      new TextRenderable(renderer, {
+        content: "",
+        height: 1,
+        wrapMode: "none",
+        truncate: true,
+        selectable: false,
+      }),
+  )
+  for (const row of chartRows) box.add(row)
+
+  function render(): void {
+    if (!activity) {
+      box.title = error ? " Activity · unavailable " : " Activity "
+      box.titleColor = error ? theme.amber : theme.dim
+      box.borderColor = error ? theme.amber : theme.cardBorder
+      for (const row of chartRows) row.content = ""
+      chartRows[chartRows.length - 1]!.content = compose(
+        fg(theme.faint)(
+          error ? "Activity history unavailable" : "Waiting for activity history",
+        ),
+      )
+      return
+    }
+
+    const forecast = activity.forecast[metric]
+    const inner = Math.max(1, panelWidth - 4)
+    const totalDays = activity.daysInMonth
+    const today = Math.min(Math.max(1, activity.today), totalDays)
+    const columns = Math.max(1, Math.min(totalDays, inner))
+    const startDay = totalDays - columns + 1
+
+    const byDay = new Map<number, number>()
+    for (const day of activity.days) {
+      byDay.set(
+        day.day,
+        metric === "cost"
+          ? day.cost
+          : metric === "requests"
+            ? day.requests
+            : day.tokens,
+      )
+    }
+
+    const values: number[] = []
+    const isForecast: boolean[] = []
+    for (let column = 0; column < columns; column++) {
+      const day = startDay + column
+      const future = day > today
+      isForecast.push(future)
+      values.push(future ? forecast.perDay : (byDay.get(day) ?? 0))
+    }
+
+    let max = forecast.perDay
+    for (const value of values) if (value > max) max = value
+    if (!(max > 0)) max = 0
+
+    const height = layout.activityChartHeight
+    const level = (value: number): number => {
+      if (!(value > 0) || !(max > 0)) return 0
+      return Math.max(1, Math.round((value / max) * height))
+    }
+    const levels = values.map(level)
+
+    for (let row = 0; row < height; row++) {
+      const threshold = height - row
+      const parts: Array<string | TextChunk | StyledText> = []
+      let buffer = ""
+      let color: string | null = null
+      const flush = (): void => {
+        if (buffer.length === 0) return
+        parts.push(color ? fg(color)(buffer) : buffer)
+        buffer = ""
+      }
+
+      for (let column = 0; column < columns; column++) {
+        const filled = (levels[column] ?? 0) >= threshold
+        const nextColor = filled
+          ? isForecast[column]
+            ? theme.faint
+            : theme.accent
+          : null
+        if (nextColor !== color) {
+          flush()
+          color = nextColor
+        }
+        buffer += filled ? (isForecast[column] ? "░" : "█") : " "
+      }
+      flush()
+
+      chartRows[row]!.content = parts.length > 0 ? compose(...parts) : ""
+    }
+
+    if (!(max > 0)) {
+      chartRows[height - 1]!.content = compose(
+        fg(theme.faint)("·".repeat(columns)),
+      )
+    }
+
+    const spent = formatMetricValue(forecast.spent, metric)
+    const projected = formatMetricValue(forecast.projected, metric)
+    box.title = ` Activity · ${activity.label} · ${spent} spent · ${projected} forecast${
+      error ? " · stale " : " "
+    }`
+    box.titleColor = error ? theme.amber : theme.dim
+    box.borderColor = error ? theme.amber : theme.cardBorder
+  }
+
+  render()
+
+  return {
+    box,
+    update(nextActivity, nextError, nextMetric) {
+      activity = nextActivity
+      error = nextError
+      metric = nextMetric
       render()
     },
     setWidth(width) {
