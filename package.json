@@ -5,8 +5,11 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
+    "compare": "bun run src/compare.ts",
+    "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build": "bun build --compile --outfile dist/oc-usage src/index.ts"
+    "build": "bun build --compile --outfile dist/oc-usage src/index.ts",
+    "build:compare": "bun build --compile --outfile dist/oc-compare src/compare.ts"
   },
   "dependencies": {
     "@opentui/core": "0.8.2"

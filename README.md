@@ -1,8 +1,13 @@
 # oc-usage
 
-A small OpenTUI dashboard for your OpenCode Go usage.
+This repository contains two OpenTUI tools:
 
-It shows the three allowance windows — 5-hour (rolling), weekly, and monthly — with:
+- **`oc-usage`** — the OpenCode Go usage dashboard described below, with a
+  built-in model comparison view (press `c`).
+- **[`oc-compare`](#oc-compare)** — the same comparison view as a standalone
+  terminal browser, backed by models.dev and OpenCode Data.
+
+`oc-usage` shows the three allowance windows — 5-hour (rolling), weekly, and monthly — with:
 
 - percent used (large) and percent remaining
 - a colored usage meter that fills with used
@@ -44,7 +49,7 @@ The bottom panel has five tabs: **Activity** (the month chart and forecast),
 │ kimi-k2.7-code:default          325  ███████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░           15%     │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────╯
 
-r refresh   m cost   t tab   p period   g panel   o console   q quit        60s auto-refresh
+r refresh   m cost   t tab   p period   g panel   c compare   o console   q quit
 ```
 
 The Activity tab mirrors the Console's Activity tab: solid bars are the days
@@ -70,13 +75,130 @@ Model and project shares use local **steps**, not local cost: Go models can show
 close proxy for Console requests. Console cost and requests remain the source of
 truth for dollars.
 
+## oc-compare
+
+A terminal model comparison browser, inspired by
+[`opencode.ai/data/compare`](https://opencode.ai/data/compare).
+
+```bash
+bun run compare
+```
+
+It loads the models.dev catalog, keeps the chat models, and lets you pick up to
+four models. With nothing selected, the right panel previews the highlighted
+model. With one or more selected, it compares list prices, context and output
+limits, benchmarks, capabilities, and — when OpenCode Data has it — real
+OpenCode usage.
+
+The comparison is also available from the usage dashboard: press `c` to open it,
+then `esc` to return. The dashboard keeps refreshing in the background while the
+comparison is open.
+
+```text
+◆ oc-compare · model comparison                545 chat models · 2/4 picked
+╭─ Models · 545 · newest · 2 picked ──╮ ╭─ Compare · 2 selected · 1-21/36 ────╮
+│▸1 Claude Sonnet 5.5      $2.00  1M  │ │                #1 Claude Sonnet 5.5 │
+│ 2 Claude Haiku 5.5       $0.10  1M  │ │ PRICE · USD / 1M TOKENS             │
+│   GPT-6.1 Sol            $4.00  1M  │ │ Input              $2.00      $0.10 │
+│   Gemini 3.8 Flash       $2.00  1M  │ │ Output            $10.00      $0.50 │
+│                                      │ │ ...                                 │
+╰──────────────────────────────────────╯ ╰─────────────────────────────────────╯
+↑↓ move  space pick  / search  s sort  tab table  x clear  r refresh  q quit
+```
+
+### Run and build
+
+```bash
+bun install
+bun run compare
+bun run typecheck
+bun test
+
+# standalone binary
+bun run build:compare
+./dist/oc-compare
+```
+
+### Keys
+
+| Key | Action |
+| --- | --- |
+| `up` / `down`, `j` / `k` | Move the model cursor, or scroll the comparison table |
+| `space` / `enter` | Add or remove the highlighted model (up to 4) |
+| `/` | Search by model, family, lab, or provider (`enter` keeps the filter, `esc` clears it) |
+| `s` | Cycle sort: newest → name → price → context |
+| `tab` | Move focus between the model list and the comparison table |
+| `x` | Clear the comparison |
+| `r` | Refresh the catalog |
+| `home` / `end` | Jump to the start or end |
+| `esc` / `c` | Return to the dashboard when opened from it |
+| `q` | Quit |
+
+`Ctrl+C` also quits and restores the terminal.
+
+### Where the data comes from
+
+| Source | Used for |
+| --- | --- |
+| `https://models.dev/models.json` | Model metadata and benchmark scores |
+| `https://models.dev/api.json` | Provider pricing |
+| `https://opencode.ai/data/{lab}/{model}.json` | OpenCode usage, list prices, and richer benchmarks for selected models |
+
+The models.dev files are cached for 12 hours:
+
+```text
+~/.cache/oc-usage/models.dev.models.json
+~/.cache/oc-usage/models.dev.pricing.json
+```
+
+If `XDG_CACHE_HOME` is set, the files live under
+`$XDG_CACHE_HOME/oc-usage` instead. `OC_COMPARE_CACHE_DIR` overrides both.
+
+If a refresh fails, the last cached catalog is used and the footer shows
+`stale`. List pricing uses the cheapest credible provider entry for the
+canonical model (the lab itself, OpenRouter, Vercel AI Gateway, and major
+clouds). Subscription, coding-plan, token-plan, promotional, and free tiers are
+ignored. When OpenCode Data has a price for a selected model, that list price is
+shown in the comparison instead. OpenCode Data enrichment is requested lazily
+only for models you select.
+
+### Options
+
+```bash
+oc-compare --check     # load the catalog, print a summary, and exit
+oc-compare --offline   # use the cached catalog without network access
+oc-compare --no-cache  # fetch fresh data even when the cache is valid
+```
+
+Environment overrides:
+
+```bash
+OC_COMPARE_CACHE_DIR=/path/to/cache
+OC_COMPARE_TTL_HOURS=6
+```
+
+### Notes and limits
+
+- No API key is required. All three endpoints are public; requests are made by
+  Bun, so browser CORS restrictions do not apply.
+- `models.dev` is community-maintained and its prices are list prices. Treat them
+  as a comparison aid, not billing truth.
+- Benchmark scores come from models.dev and OpenCode Data. They mix vendor-reported
+  and independent numbers, so check the `source` field in the underlying JSON
+  before making a strong claim.
+- OpenCode Data only covers models that appear in OpenCode usage. A selected model
+  without a data page simply shows no OpenCode usage section.
+- The comparison is limited to four models so the columns stay readable on a
+  normal terminal. Scroll the table with `tab` then `j` / `k` to see every row.
+
 ## Requirements
 
-- OpenCode installed and the background service running
+- `oc-usage`: OpenCode installed and the background service running
+- `oc-compare`: Bun and network access on first run; no OpenCode service is needed
 - Bun 1.3.14+ to run from source
 - macOS arm64 for the prebuilt binary (the build uses the host target)
 
-The dashboard reads from OpenCode's local background service. Local session
+The `oc-usage` dashboard reads from OpenCode's local background service. Local session
 analytics, model/tool/project breakdowns, and the running-session count come from
 the same service. The usage summary uses the active Console credential saved by
 OpenCode and calls the same Console API as the Activity → My usage page. Apart
@@ -108,6 +230,7 @@ bun run build
 | `p` | Cycle the insights period (Today → This week → This month) for Models/Tools |
 | `m` | Cycle the activity graph metric (cost → requests → tokens) |
 | `g` | Show or hide the insights panel |
+| `c` | Open the model comparison (press `c` again or `esc` to return) |
 | `o` | Open the OpenCode Console usage page |
 | `q` | Quit |
 
@@ -265,25 +388,30 @@ If that does not help, check your network connection to `opencode.ai`.
 - The “monthly” allowance window is a roughly 30-day cycle, not the calendar month.
 - Only the active workspace and Console user are shown.
 - This version targets macOS arm64; adjust the `build` script for another host/platform.
-- There is no automated test suite yet. Use `bun run typecheck` and the manual checks below.
+- `bun test` covers the catalog filtering, sorting, and benchmark parsing helpers. Use `bun run typecheck` plus the manual checks below for the TUI itself.
 
 ## Manual checks
 
-1. `bun run typecheck`
-2. `bun run start` — verify data, colors, countdowns, reset times, the activity graph, the usage pulse, and the insights panel.
-3. Press `t` to cycle Activity → Models → Tools → Projects → Efficiency, `p` to cycle the period on Models/Tools, `m` (cost → requests → tokens), `g` (hide/show the panel), `o`, and `q`.
-4. Verify the running-session badge appears when OpenCode has an active session.
-5. Verify a pace warning appears on a meter when its current pace projects above 100% at reset.
-6. Resize to 80x24 (insights hidden), 100x30 (insights shown), and 120x40.
-7. Simulate a service failure without touching the real service:
+1. `bun run typecheck` and `bun test`
+2. `bun run compare --check` — verify the catalog loads, reports the chat-model count, and finds pricing and benchmarks.
+3. `bun run compare` — search (`/`), select two or more models (`space`), switch to the table (`tab`), scroll it (`j`/`k`), and verify prices, limits, benchmarks, and OpenCode usage.
+4. `bun run start` — verify data, colors, countdowns, reset times, the activity graph, the usage pulse, and the insights panel.
+5. Press `c` to open the model comparison, `esc` to return, then `t` to cycle Activity → Models → Tools → Projects → Efficiency, `p` to cycle the period on Models/Tools, `m` (cost → requests → tokens), `g` (hide/show the panel), `o`, and `q`.
+6. Verify the running-session badge appears when OpenCode has an active session.
+7. Verify a pace warning appears on a meter when its current pace projects above 100% at reset.
+8. Resize to 80x24 (insights hidden), 100x30 (insights shown), and 120x40.
+9. Simulate a service failure without touching the real service:
 
    ```bash
    OPENCODE_SERVICE_URL=http://127.0.0.1:1 OPENCODE_SERVICE_PASSWORD=x bun run start
    ```
 
-8. Build and run the binary:
+10. Build and run the binaries:
 
-   ```bash
-   bun run build
-   ./dist/oc-usage
-   ```
+    ```bash
+    bun run build
+    ./dist/oc-usage
+
+    bun run build:compare
+    ./dist/oc-compare
+    ```

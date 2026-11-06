@@ -77,6 +77,7 @@ export type DashboardState = {
 export type Dashboard = {
   update(state: DashboardState): void
   reflow(width: number, height: number): void
+  setVisible(visible: boolean): void
   destroy(): void
 }
 
@@ -364,6 +365,7 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
       keyParts.push("  ", fg(theme.accent)(bold("p")), " period")
     }
     keyParts.push("  ", fg(theme.accent)(bold("g")), " panel")
+    keyParts.push("  ", fg(theme.accent)(bold("c")), " compare")
     if (canOpen) {
       keyParts.push("  ", fg(theme.accent)(bold("o")), " console")
     }
@@ -412,6 +414,9 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
       renderState()
     },
     reflow,
+    setVisible(visible) {
+      root.visible = visible
+    },
     destroy() {
       renderer.off(CliRenderEvents.RESIZE, resizeHandler)
     },

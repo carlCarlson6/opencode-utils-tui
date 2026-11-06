@@ -9,6 +9,8 @@ export const theme = {
   green: "#22c55e",
   amber: "#f59e0b",
   red: "#ef4444",
+  violet: "#c084fc",
+  selection: "#1e293b",
   barTrack: "#475569",
 } as const
 

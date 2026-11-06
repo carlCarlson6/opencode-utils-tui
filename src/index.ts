@@ -1,4 +1,9 @@
-import { createCliRenderer, type CliRenderer } from "@opentui/core"
+import {
+  CliRenderEvents,
+  createCliRenderer,
+  type CliRenderer,
+} from "@opentui/core"
+import { createCompareSession } from "./compare"
 import {
   createDashboard,
   type DashboardState,
@@ -82,6 +87,13 @@ async function main(): Promise<void> {
   }
 
   const dashboard = createDashboard(renderer)
+  const compare = createCompareSession(renderer, { embedded: true })
+  const compareResizeHandler = (width: number, height: number): void => {
+    compare.reflow(width, height)
+  }
+  renderer.on(CliRenderEvents.RESIZE, compareResizeHandler)
+
+  let mode: "dashboard" | "compare" = "dashboard"
   const triggeredResets = new Set<number>()
   let refreshing = false
   let shuttingDown = false
@@ -109,6 +121,23 @@ async function main(): Promise<void> {
   }
 
   const render = (): void => dashboard.update(state)
+
+  const openCompare = (): void => {
+    if (mode === "compare") return
+    mode = "compare"
+    dashboard.setVisible(false)
+    compare.activate()
+    compare.reflow(renderer.width, renderer.height)
+  }
+
+  const closeCompare = (): void => {
+    if (mode === "dashboard") return
+    mode = "dashboard"
+    compare.deactivate()
+    dashboard.setVisible(true)
+    dashboard.reflow(renderer.width, renderer.height)
+    render()
+  }
 
   const pruneTriggeredResets = (data: UsageData): void => {
     const active = new Set([
@@ -314,6 +343,8 @@ async function main(): Promise<void> {
       activeTimer = null
     }
 
+    renderer.off(CliRenderEvents.RESIZE, compareResizeHandler)
+    compare.destroy()
     renderer.destroy()
     try {
       await renderer.closed
@@ -325,7 +356,18 @@ async function main(): Promise<void> {
   renderer.keyInput.on("keypress", (key) => {
     if (key.eventType === "release") return
 
+    if (mode === "compare") {
+      const result = compare.handleKey(key)
+      if (result === "exit") closeCompare()
+      else if (result === "quit") void shutdown()
+      return
+    }
+
     const name = key.name.toLowerCase()
+    if (name === "c") {
+      openCompare()
+      return
+    }
     if (name === "q") {
       void shutdown()
       return
@@ -366,7 +408,11 @@ async function main(): Promise<void> {
     const now = Date.now()
     checkResets(now)
     if (!refreshing && now >= state.nextRefreshAt) void refresh()
-    render()
+    if (mode === "compare") {
+      compare.tick()
+    } else {
+      render()
+    }
   }, TICK_MS)
 
   activeTimer = setInterval(() => {
@@ -411,6 +457,7 @@ Keys:
   t  Cycle the insights tab (activity, models, tools, projects, efficiency)
   p  Cycle the insights period (today, week, month)
   g  Toggle the insights panel
+  c  Open the model comparison
   m  Cycle the graph metric (cost, requests, tokens)
   o  Open OpenCode Console
   q  Quit
