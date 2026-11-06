@@ -1,6 +1,11 @@
 import { createCliRenderer, type CliRenderer } from "@opentui/core"
 import { createDashboard, type DashboardState } from "./dashboard"
-import { fetchUsage, loadServiceConfig, toUsageError } from "./service"
+import {
+  fetchStats,
+  fetchUsage,
+  loadServiceConfig,
+  toUsageError,
+} from "./service"
 import { theme } from "./theme"
 import type { UsageData } from "./service"
 
@@ -58,7 +63,9 @@ async function main(): Promise<void> {
 
   let state: DashboardState = {
     data: null,
+    stats: null,
     error: null,
+    statsError: null,
     lastUpdated: null,
     loading: true,
     nextRefreshAt: Date.now(),
@@ -108,17 +115,40 @@ async function main(): Promise<void> {
 
     try {
       const config = await loadServiceConfig()
-      const data = await fetchUsage(config)
+      const [usageResult, statsResult] = await Promise.allSettled([
+        fetchUsage(config),
+        fetchStats(config),
+      ])
       const now = Date.now()
+      const stats =
+        statsResult.status === "fulfilled" ? statsResult.value : state.stats
+      const statsError =
+        statsResult.status === "rejected"
+          ? toUsageError(statsResult.reason)
+          : null
 
-      state = {
-        data,
-        error: null,
-        lastUpdated: now,
-        loading: false,
-        nextRefreshAt: now + REFRESH_INTERVAL_MS,
+      if (usageResult.status === "rejected") {
+        state = {
+          ...state,
+          stats,
+          statsError,
+          error: toUsageError(usageResult.reason),
+          loading: false,
+          nextRefreshAt: now + ERROR_RETRY_MS,
+        }
+      } else {
+        const data = usageResult.value
+        state = {
+          data,
+          stats,
+          error: null,
+          statsError,
+          lastUpdated: now,
+          loading: false,
+          nextRefreshAt: now + REFRESH_INTERVAL_MS,
+        }
+        pruneTriggeredResets(data)
       }
-      pruneTriggeredResets(data)
     } catch (error) {
       state = {
         ...state,

@@ -10,16 +10,26 @@ It shows the three allowance windows — 5-hour (rolling), weekly, and monthly �
 - reset time in your local timezone
 - `LIMITED` state when a window is exhausted
 
+Below the allowance meters, a usage summary shows Console cost, requests, and
+tokens for today, this week, and this month.
+
 ```text
 ◆ OpenCode Go · carl's stuff                                            updated 2s ago
 
 ╭─ 5-hour window ──────────────╮ ╭─ Weekly ─────────────────────╮ ╭─ Monthly ────────────────────╮
-│ 15% used                     │ │ 33% used                     │ │ 32% used                     │
-│ ████░░░░░░░░░░░░░░░░░░░░░░░░ │ │ █████████░░░░░░░░░░░░░░░░░░░ │ │ █████████░░░░░░░░░░░░░░░░░░░ │
-│ 85% left                     │ │ 67% left                     │ │ 68% left                     │
+│ 16% used                     │ │ 33% used                     │ │ 32% used                     │
+│ █████░░░░░░░░░░░░░░░░░░░░░░░ │ │ █████████░░░░░░░░░░░░░░░░░░░ │ │ █████████░░░░░░░░░░░░░░░░░░░ │
+│ 84% left                     │ │ 67% left                     │ │ 68% left                     │
 │ Resets in 3h 15m             │ │ Resets in 2d 13h             │ │ Resets in 23d 3h             │
 │ Today at 15:05               │ │ Mon at 01:00                 │ │ Nov 29 at 15:36              │
 ╰──────────────────────────────╯ ╰──────────────────────────────╯ ╰──────────────────────────────╯
+
+╭─ Usage ────────────────────────────────────────────────────────────────────────────────────────╮
+│                                  Today                 This week                This month     │
+│ Cost                             $2.46                    $11.03                    $14.82     │
+│ Requests                           760                     1,361                     2,148     │
+│ Tokens                          137.4m                    238.1m                    512.6m     │
+╰────────────────────────────────────────────────────────────────────────────────────────────────╯
 
 r refresh   o console   q quit                                                    60s auto-refresh
 ```
@@ -30,7 +40,11 @@ r refresh   o console   q quit                                                  
 - Bun 1.3.14+ to run from source
 - macOS arm64 for the prebuilt binary (the build uses the host target)
 
-The dashboard reads from OpenCode's local background service. It does not need a browser session and does not contact any remote server except when you press `o` to open the Console.
+The dashboard reads from OpenCode's local background service. The usage summary
+uses the active Console credential saved by OpenCode and calls the same Console
+API as the Activity → My usage page. Apart from that request to `opencode.ai`,
+it does not contact any remote server except when you press `o` to open the
+Console.
 
 ## Run from source
 
@@ -60,14 +74,29 @@ bun run build
 
 ## Where the data comes from
 
-The app calls this local endpoint:
+The app calls these local endpoints:
 
 ```http
 GET /api/experimental/usage/limits
+GET /api/credential
 Authorization: Basic base64("opencode:<service password>")
 ```
 
-It discovers the service from:
+The first supplies the allowance meters. The second supplies the active OpenCode
+Console credential. (The service returns all stored credentials, but oc-usage
+only reads the active `opencode` one.) The app then calls the Console usage
+endpoint with that credential:
+
+```http
+GET https://opencode.ai/console/api/usage/summary
+Authorization: Bearer <Console access token>
+x-org-id: <workspace ID>
+```
+
+It is called three times — for today, this week, and this month — and supplies
+the same cost, request, and token totals shown in the Console. The Console
+credential is only ever sent to `opencode.ai`. The local service is discovered
+from:
 
 ```text
 $XDG_STATE_HOME/opencode/service.json
@@ -100,16 +129,19 @@ OPENCODE_SERVICE_PASSWORD="$(jq -r .password ~/.local/state/opencode/service.jso
 ./dist/oc-usage
 ```
 
-The service URL must be `localhost`, `127.0.0.1`, or `::1`; the app refuses to send the password anywhere else.
+The service URL must be `localhost`, `127.0.0.1`, or `::1`; the app refuses to send the service password anywhere else. The active Console credential is only sent to `opencode.ai`.
 
 ## Behavior
 
 - Fetches on start, then every 60 seconds.
 - Ticks countdowns and the “updated” indicator every second.
 - On a failed fetch, keeps the last good data and retries after 10 seconds.
+- If the usage summary fails but the allowance meters work, the meters stay
+  visible and the summary is marked `stale` or `unavailable`.
 - When a reset time passes, shows `Resetting…` and checks again shortly.
 - If the service is down, shows an actionable error instead of starting or restarting it.
-- At 80x24 the third card wraps below the first two. Below 80x24, a resize warning is shown.
+- At 80x24 all three allowance cards stay in one row, with the usage table
+  below. Below 80x24, a resize warning is shown.
 
 ## Troubleshooting
 
@@ -139,19 +171,33 @@ opencode auth login
 
 The signed-in console workspace does not have an active Go plan.
 
+**The usage summary says “unavailable”**
+
+The app could not find an active OpenCode Console credential, or the Console
+rejected it. Sign in again and press `r`:
+
+```bash
+opencode auth login
+```
+
+If that does not help, check your network connection to `opencode.ai`.
+
 ## Notes and limits
 
-- The endpoint is experimental/internal. It is isolated in `src/service.ts`, so a future OpenCode API change only needs a fix there.
-- The API exposes percentages only, not tokens or dollars.
-- The “monthly” window is a roughly 30-day cycle, not the calendar month.
-- Only the active workspace is shown.
+- The endpoints are experimental/internal. They are isolated in `src/service.ts`, so a future OpenCode API change only needs a fix there.
+- The allowance limits endpoint exposes percentages only. Cost, requests, and tokens come from the Console usage API.
+- The usage summary matches the Console’s **Activity → My usage** figures for the active workspace and user.
+- “Today” is the Console’s Today range. The week starts Monday (UTC) and the month starts on the 1st (UTC), matching the Console’s date buckets.
+- The app reads the active Console credential from the local OpenCode service and sends it only to `opencode.ai`.
+- The “monthly” allowance window is a roughly 30-day cycle, not the calendar month.
+- Only the active workspace and Console user are shown.
 - This version targets macOS arm64; adjust the `build` script for another host/platform.
 - There is no automated test suite in v1. Use `bun run typecheck` and the manual checks below.
 
 ## Manual checks
 
 1. `bun run typecheck`
-2. `bun run start` — verify data, colors, countdowns, and reset times.
+2. `bun run start` — verify data, colors, countdowns, reset times, and the usage summary.
 3. Press `r`, `o`, and `q`.
 4. Resize to 80x24, 100x30, and 120x40.
 5. Simulate a service failure without touching the real service:

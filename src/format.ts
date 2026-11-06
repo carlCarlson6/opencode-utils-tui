@@ -55,6 +55,39 @@ export function formatShort(ms: number): string {
   return formatDuration(ms)
 }
 
+export function formatCost(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "$0.00"
+  if (value < 0.01) return "<$0.01"
+  return `$${value.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`
+}
+
+export function formatCount(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0"
+  return Math.round(value).toLocaleString("en-US")
+}
+
+export function formatTokens(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0"
+
+  const units = [
+    { size: 1_000_000_000, suffix: "b" },
+    { size: 1_000_000, suffix: "m" },
+    { size: 1_000, suffix: "k" },
+  ] as const
+
+  for (const unit of units) {
+    if (value >= unit.size) {
+      const scaled = value / unit.size
+      return `${scaled.toFixed(1).replace(/\.0$/, "")}${unit.suffix}`
+    }
+  }
+
+  return formatCount(value)
+}
+
 export function formatAgo(ms: number): string {
   const elapsed = Math.max(0, ms)
   if (elapsed < 1000) return "just now"

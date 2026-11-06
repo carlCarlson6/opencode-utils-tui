@@ -3,6 +3,9 @@ import { homedir } from "node:os"
 import { isAbsolute, join } from "node:path"
 
 const USAGE_ENDPOINT = "/api/experimental/usage/limits"
+const CREDENTIAL_ENDPOINT = "/api/credential"
+const CONSOLE_USAGE_ENDPOINT = "/api/usage/summary"
+const MICRO_CENTS_PER_DOLLAR = 100_000_000
 const REQUEST_TIMEOUT_MS = 5_000
 
 type JsonObject = Record<string, unknown>
@@ -30,6 +33,29 @@ export type ServiceConfig = {
   url: string
   password: string
 }
+
+export type PeriodStats = {
+  cost: number
+  requests: number
+  tokens: number
+}
+
+export type StatsData = {
+  today: PeriodStats
+  week: PeriodStats
+  month: PeriodStats
+}
+
+type ConsoleCredential = {
+  accessToken: string
+  orgID: string
+  userID: string | undefined
+  baseURL: string
+}
+
+type ConsoleUsageQuery =
+  | { range: "24h" }
+  | { from: string; to: string }
 
 export class UsageError extends Error {
   readonly title: string
@@ -69,6 +95,162 @@ export async function loadServiceConfig(): Promise<ServiceConfig> {
 }
 
 export async function fetchUsage(config: ServiceConfig): Promise<UsageData> {
+  const body = await requestEndpoint(config, USAGE_ENDPOINT, "usage")
+  return parseUsageResponse(body)
+}
+
+export async function fetchStats(
+  config: ServiceConfig,
+  now = Date.now(),
+): Promise<StatsData> {
+  const credential = await fetchConsoleCredential(config)
+  const queries = consoleUsageQueries(now)
+  const [today, week, month] = await Promise.all([
+    fetchConsoleSummary(credential, queries.today),
+    fetchConsoleSummary(credential, queries.week),
+    fetchConsoleSummary(credential, queries.month),
+  ])
+  return { today, week, month }
+}
+
+function consoleUsageQueries(now: number): {
+  today: ConsoleUsageQuery
+  week: ConsoleUsageQuery
+  month: ConsoleUsageQuery
+} {
+  const today = utcDate(now)
+  return {
+    today: { range: "24h" },
+    week: { from: startOfUtcWeek(now), to: today },
+    month: { from: startOfUtcMonth(now), to: today },
+  }
+}
+
+async function fetchConsoleCredential(
+  config: ServiceConfig,
+): Promise<ConsoleCredential> {
+  const body = await requestEndpoint(config, CREDENTIAL_ENDPOINT, "credentials")
+  if (!isObject(body)) {
+    throw invalidResponse("The credentials response was missing expected fields.")
+  }
+
+  const entries = body.data
+  if (!Array.isArray(entries)) {
+    throw invalidResponse("The credentials response was not a list.")
+  }
+
+  const entry = entries.find(
+    (item): item is JsonObject =>
+      isObject(item) &&
+      item.integrationID === "opencode" &&
+      item.active === true,
+  )
+  if (!entry || !isObject(entry.value)) throw noConsoleCredential()
+
+  const value = entry.value
+  const type = stringField(value.type)
+  const accessToken =
+    type === "oauth"
+      ? stringField(value.access)
+      : type === "key"
+        ? stringField(value.key)
+        : undefined
+  if (!accessToken) throw noConsoleCredential()
+
+  const metadata = isObject(value.metadata) ? value.metadata : undefined
+  const orgID = metadata ? stringField(metadata.orgID) : undefined
+  const userID = metadata ? stringField(metadata.accountID) : undefined
+  const server = metadata ? stringField(metadata.server) : undefined
+  if (!orgID || !server) throw noConsoleCredential()
+
+  return {
+    accessToken,
+    orgID,
+    userID,
+    baseURL: validateConsoleServer(server),
+  }
+}
+
+async function fetchConsoleSummary(
+  credential: ConsoleCredential,
+  query: ConsoleUsageQuery,
+): Promise<PeriodStats> {
+  const params = new URLSearchParams()
+  if ("range" in query) {
+    params.set("range", query.range)
+  } else {
+    params.set("from", query.from)
+    params.set("to", query.to)
+  }
+  if (credential.userID) params.set("userId", credential.userID)
+
+  let response: Response
+  try {
+    response = await fetch(
+      `${credential.baseURL}${CONSOLE_USAGE_ENDPOINT}?${params.toString()}`,
+      {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${credential.accessToken}`,
+          "x-org-id": credential.orgID,
+        },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      },
+    )
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw new UsageError(
+        "OpenCode Console is taking too long",
+        "The Console usage endpoint did not answer within 5 seconds.",
+        "Press r to retry.",
+        { cause: error },
+      )
+    }
+    throw new UsageError(
+      "Can't reach OpenCode Console",
+      "The Console usage endpoint did not respond.",
+      "Check your connection, then press r.",
+      { cause: error },
+    )
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    throw new UsageError(
+      "OpenCode Console authentication failed",
+      "The saved Console credential was rejected.",
+      "Run `opencode auth login` to sign in again, then press r.",
+    )
+  }
+
+  if (!response.ok) {
+    throw new UsageError(
+      "OpenCode Console returned an error",
+      `The usage summary endpoint returned HTTP ${response.status}.`,
+      "Press r to retry.",
+    )
+  }
+
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch (error) {
+    throw new UsageError(
+      "Unexpected response from OpenCode Console",
+      "The usage summary endpoint did not return valid JSON.",
+      "OpenCode may have changed the Console API. Press r to retry.",
+      { cause: error },
+    )
+  }
+
+  return parseConsoleSummary(body)
+}
+
+async function requestEndpoint(
+  config: ServiceConfig,
+  path: string,
+  label: string,
+): Promise<unknown> {
   const authorization = Buffer.from(
     `opencode:${config.password}`,
     "utf8",
@@ -76,7 +258,7 @@ export async function fetchUsage(config: ServiceConfig): Promise<UsageData> {
 
   let response: Response
   try {
-    response = await fetch(new URL(USAGE_ENDPOINT, config.url), {
+    response = await fetch(new URL(path, config.url), {
       method: "GET",
       headers: {
         Accept: "application/json",
@@ -112,24 +294,21 @@ export async function fetchUsage(config: ServiceConfig): Promise<UsageData> {
   if (!response.ok) {
     throw new UsageError(
       "OpenCode returned an error",
-      `The usage endpoint returned HTTP ${response.status}.`,
+      `The ${label} endpoint returned HTTP ${response.status}.`,
       "Check `opencode service status` or the OpenCode logs, then press r.",
     )
   }
 
-  let body: unknown
   try {
-    body = await response.json()
+    return await response.json()
   } catch (error) {
     throw new UsageError(
       "Unexpected response from OpenCode",
-      "The usage endpoint did not return valid JSON.",
-      "OpenCode may have changed its experimental usage API.",
+      `The ${label} endpoint did not return valid JSON.`,
+      "OpenCode may have changed its experimental API.",
       { cause: error },
     )
   }
-
-  return parseUsageResponse(body)
 }
 
 export function toUsageError(error: unknown): UsageError {
@@ -246,6 +425,58 @@ function parseUsageResponse(body: unknown): UsageData {
   }
 }
 
+function parseConsoleSummary(body: unknown): PeriodStats {
+  if (!isObject(body)) {
+    throw consoleResponseError()
+  }
+
+  const costMicroCents = numericField(body.totalCostMicroCents)
+  const requests = numericField(body.totalRequests)
+  const inputTokens = numericField(body.totalInputTokens)
+  const outputTokens = numericField(body.totalOutputTokens)
+  const cacheReadTokens = numericField(body.totalCacheReadTokens)
+  const cacheWrite5mTokens = numericField(body.totalCacheWrite5mTokens) ?? 0
+  const cacheWrite1hTokens = numericField(body.totalCacheWrite1hTokens) ?? 0
+  const cacheWriteTokens = numericField(body.totalCacheWriteTokens) ?? 0
+
+  if (
+    costMicroCents === undefined ||
+    requests === undefined ||
+    inputTokens === undefined ||
+    outputTokens === undefined ||
+    cacheReadTokens === undefined
+  ) {
+    throw consoleResponseError()
+  }
+
+  const writes =
+    cacheWrite5mTokens + cacheWrite1hTokens > 0
+      ? cacheWrite5mTokens + cacheWrite1hTokens
+      : cacheWriteTokens
+
+  return {
+    cost: costMicroCents / MICRO_CENTS_PER_DOLLAR,
+    requests,
+    tokens: inputTokens + outputTokens + cacheReadTokens + writes,
+  }
+}
+
+function consoleResponseError(): UsageError {
+  return new UsageError(
+    "Unexpected response from OpenCode Console",
+    "The Console usage summary was missing expected fields.",
+    "OpenCode may have changed the Console API. Update oc-usage or OpenCode, then press r.",
+  )
+}
+
+function noConsoleCredential(): UsageError {
+  return new UsageError(
+    "OpenCode Console credential not found",
+    "No active OpenCode Console credential was found in the local service.",
+    "Sign in with `opencode auth login`, then press r.",
+  )
+}
+
 function parseMeter(value: unknown, name: string): Meter {
   if (!isObject(value)) {
     throw invalidResponse(`The ${name} window is missing from the usage response.`)
@@ -286,8 +517,63 @@ function invalidResponse(
   return new UsageError(
     "Unexpected response from OpenCode",
     detail,
-    "OpenCode may have changed its experimental usage API. Update oc-usage or OpenCode, then press r.",
+    "OpenCode may have changed its experimental API. Update oc-usage or OpenCode, then press r.",
   )
+}
+
+function utcDate(now: number): string {
+  return new Date(now).toISOString().slice(0, 10)
+}
+
+function startOfUtcWeek(now: number): string {
+  const date = new Date(now)
+  const daysSinceMonday = (date.getUTCDay() + 6) % 7
+  return utcDate(
+    Date.UTC(
+      date.getUTCFullYear(),
+      date.getUTCMonth(),
+      date.getUTCDate() - daysSinceMonday,
+    ),
+  )
+}
+
+function startOfUtcMonth(now: number): string {
+  const date = new Date(now)
+  return utcDate(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1))
+}
+
+function validateConsoleServer(value: string): string {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch (error) {
+    throw new UsageError(
+      "Invalid OpenCode Console URL",
+      `The saved Console URL is not valid: ${value}`,
+      "Sign in with `opencode auth login`, then press r.",
+      { cause: error },
+    )
+  }
+
+  if (url.protocol !== "https:") {
+    throw new UsageError(
+      "Invalid OpenCode Console URL",
+      `The Console URL must use https, not ${url.protocol}.`,
+      "Sign in with `opencode auth login`, then press r.",
+    )
+  }
+
+  const host = url.hostname.toLowerCase()
+  if (host !== "opencode.ai" && host !== "console.opencode.ai") {
+    throw new UsageError(
+      "Refusing to use a non-OpenCode Console URL",
+      `The saved Console URL points at ${url.hostname}.`,
+      "oc-usage only sends the Console credential to opencode.ai.",
+    )
+  }
+
+  const path = url.pathname.replace(/\/+$/, "")
+  return `https://opencode.ai${path === "" ? "/console" : path}`
 }
 
 function nonEmpty(value: unknown): string | undefined {
@@ -302,6 +588,14 @@ function stringField(value: unknown): string | undefined {
 
 function numberField(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function numericField(value: unknown): number | undefined {
+  if (typeof value === "number") return numberField(value)
+  if (typeof value !== "string" || value.trim() === "") return undefined
+
+  const numeric = Number(value)
+  return Number.isFinite(numeric) ? numeric : undefined
 }
 
 function timestampField(value: unknown): number | undefined {

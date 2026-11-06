@@ -16,5 +16,7 @@ export const layout = {
   minWidth: 80,
   minHeight: 24,
   cardHeight: 7,
+  cardMinWidth: 24,
+  statsHeight: 6,
   rootPadding: 1,
 } as const

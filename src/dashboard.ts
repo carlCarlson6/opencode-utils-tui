@@ -14,21 +14,32 @@ import {
 import {
   clampPercent,
   formatAgo,
+  formatCost,
+  formatCount,
   formatDuration,
   formatPercent,
   formatResetClock,
   formatShort,
+  formatTokens,
   meterColor,
   remainingPercent,
   renderBar,
   truncateText,
 } from "./format"
 import { layout, theme } from "./theme"
-import type { Meter, UsageData, UsageError } from "./service"
+import type {
+  Meter,
+  PeriodStats,
+  StatsData,
+  UsageData,
+  UsageError,
+} from "./service"
 
 export type DashboardState = {
   data: UsageData | null
+  stats: StatsData | null
   error: UsageError | null
+  statsError: UsageError | null
   lastUpdated: number | null
   loading: boolean
   nextRefreshAt: number
@@ -46,6 +57,12 @@ type MeterCard = {
   setWidth(width: number): void
 }
 
+type StatsPanel = {
+  box: BoxRenderable
+  update(stats: StatsData | null, error: UsageError | null): void
+  setWidth(width: number): void
+}
+
 type Overlay = {
   show(
     title: string,
@@ -60,7 +77,9 @@ type Overlay = {
 export function createDashboard(renderer: CliRenderer): Dashboard {
   let currentState: DashboardState = {
     data: null,
+    stats: null,
     error: null,
+    statsError: null,
     lastUpdated: null,
     loading: true,
     nextRefreshAt: Date.now(),
@@ -115,6 +134,7 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
     flexDirection: "column",
     justifyContent: "center",
     alignItems: "stretch",
+    gap: 1,
   })
   const cardsRow = new BoxRenderable(renderer, {
     id: "cards-row",
@@ -132,6 +152,9 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
     createMeterCard(renderer, "Monthly"),
   ]
   for (const card of cards) cardsRow.add(card.box)
+
+  const statsPanel = createStatsPanel(renderer)
+  cardsArea.add(statsPanel.box)
   root.add(cardsArea)
 
   const footer = new BoxRenderable(renderer, {
@@ -176,14 +199,15 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
     currentHeight = height
 
     const contentWidth = Math.max(0, width - layout.rootPadding * 2)
-    const columns = contentWidth >= 96 ? 3 : contentWidth >= 62 ? 2 : 1
+    const columns = contentWidth >= 74 ? 3 : contentWidth >= 49 ? 2 : 1
     const gap = 1
     const cardWidth = Math.max(
-      24,
+      layout.cardMinWidth,
       Math.floor((contentWidth - gap * (columns - 1)) / columns),
     )
 
     for (const card of cards) card.setWidth(cardWidth)
+    statsPanel.setWidth(contentWidth)
     renderState()
   }
 
@@ -221,6 +245,8 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
     cards[0]?.update(data?.go.rolling ?? null, now)
     cards[1]?.update(data?.go.weekly ?? null, now)
     cards[2]?.update(data?.go.monthly ?? null, now)
+
+    statsPanel.update(state.stats, state.statsError)
 
     const retrying = error !== null && !state.loading
     const canOpen = Boolean(data?.workspace.usageURL)
@@ -329,7 +355,7 @@ function createMeterCard(renderer: CliRenderer, title: string): MeterCard {
     fg: theme.faint,
   })
   const resetInText = new TextRenderable(renderer, {
-    content: "Waiting for usage data",
+    content: "Waiting for data",
     height: 1,
     wrapMode: "none",
     truncate: true,
@@ -367,7 +393,7 @@ function createMeterCard(renderer: CliRenderer, title: string): MeterCard {
         barText.content = renderBar(0, barWidth, theme.faint)
         leftText.content = "--% left"
         leftText.fg = theme.faint
-        resetInText.content = "Waiting for usage data"
+        resetInText.content = "Waiting for data"
         resetInText.fg = theme.faint
         resetAtText.content = ""
         return
@@ -397,7 +423,7 @@ function createMeterCard(renderer: CliRenderer, title: string): MeterCard {
       if (meter.resetsAt <= now) {
         resetInText.content = "Resetting…"
         resetInText.fg = theme.accent
-        resetAtText.content = "Waiting for fresh data"
+        resetAtText.content = "Waiting for data"
       } else {
         resetInText.content = `Resets in ${formatDuration(meter.resetsAt - now)}`
         resetInText.fg = theme.text
@@ -406,6 +432,138 @@ function createMeterCard(renderer: CliRenderer, title: string): MeterCard {
       resetAtText.fg = theme.dim
     },
   }
+}
+
+function createStatsPanel(renderer: CliRenderer): StatsPanel {
+  let panelWidth = 78
+  let currentStats: StatsData | null = null
+  let currentError: UsageError | null = null
+
+  const box = new BoxRenderable(renderer, {
+    id: "stats",
+    height: layout.statsHeight,
+    flexShrink: 0,
+    flexDirection: "column",
+    border: true,
+    borderStyle: "rounded",
+    borderColor: theme.cardBorder,
+    title: " Usage ",
+    titleColor: theme.dim,
+    titleAlignment: "left",
+    backgroundColor: theme.card,
+    paddingLeft: 1,
+    paddingRight: 1,
+  })
+
+  const headerRow = createStatsRow(renderer)
+  const costRow = createStatsRow(renderer)
+  const requestsRow = createStatsRow(renderer)
+  const tokensRow = createStatsRow(renderer)
+  box.add(headerRow)
+  box.add(costRow)
+  box.add(requestsRow)
+  box.add(tokensRow)
+
+  function renderRow(
+    label: string,
+    color: string,
+    formatValue: (period: PeriodStats) => string,
+    labelWidth: number,
+    columnWidth: number,
+    gap: number,
+  ): StyledText {
+    const periods = currentStats
+      ? [currentStats.today, currentStats.week, currentStats.month]
+      : null
+    const valueColor = !currentStats
+      ? theme.faint
+      : currentError
+        ? theme.dim
+        : color
+    const values = periods ? periods.map(formatValue) : ["--", "--", "--"]
+
+    return compose(
+      fg(theme.dim)(label.padEnd(labelWidth)),
+      ...values.map((value) =>
+        fg(valueColor)(`${value.padStart(columnWidth)}${" ".repeat(gap)}`),
+      ),
+    )
+  }
+
+  function render(): void {
+    if (currentError) {
+      box.title = currentStats ? " Usage · stale " : " Usage · unavailable "
+      box.titleColor = theme.amber
+    } else {
+      box.title = " Usage "
+      box.titleColor = theme.dim
+    }
+
+    const inner = Math.max(0, panelWidth - 4)
+    const labelWidth = Math.min(14, Math.max(9, Math.floor(inner * 0.18)))
+    const gap = 2
+    const columnWidth = Math.max(
+      6,
+      Math.floor((inner - labelWidth - gap * 3) / 3),
+    )
+
+    headerRow.content = compose(
+      fg(theme.dim)("".padEnd(labelWidth)),
+      ...["Today", "This week", "This month"].map((header) =>
+        fg(theme.dim)(`${header.padStart(columnWidth)}${" ".repeat(gap)}`),
+      ),
+    )
+
+    costRow.content = renderRow(
+      "Cost",
+      theme.green,
+      (period) => formatCost(period.cost),
+      labelWidth,
+      columnWidth,
+      gap,
+    )
+    requestsRow.content = renderRow(
+      "Requests",
+      theme.accent,
+      (period) => formatCount(period.requests),
+      labelWidth,
+      columnWidth,
+      gap,
+    )
+    tokensRow.content = renderRow(
+      "Tokens",
+      theme.text,
+      (period) => formatTokens(period.tokens),
+      labelWidth,
+      columnWidth,
+      gap,
+    )
+  }
+
+  render()
+
+  return {
+    box,
+    update(stats, error) {
+      currentStats = stats
+      currentError = error
+      render()
+    },
+    setWidth(width) {
+      panelWidth = Math.max(0, width)
+      render()
+    },
+  }
+}
+
+function createStatsRow(renderer: CliRenderer): TextRenderable {
+  return new TextRenderable(renderer, {
+    content: "",
+    height: 1,
+    wrapMode: "none",
+    truncate: true,
+    selectable: false,
+  })
 }
 
 function createOverlay(renderer: CliRenderer): Overlay & { box: BoxRenderable } {
