@@ -15,11 +15,11 @@ export const theme = {
 export const layout = {
   minWidth: 80,
   minHeight: 24,
-  minHeightForActivity: 26,
+  minHeightForInsights: 26,
   cardHeight: 7,
   cardMinWidth: 24,
   statsHeight: 6,
-  activityHeight: 5,
-  activityChartHeight: 3,
+  insightsHeight: 5,
+  insightsChartHeight: 3,
   rootPadding: 1,
 } as const

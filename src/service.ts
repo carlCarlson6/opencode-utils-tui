@@ -5,9 +5,13 @@ import { isAbsolute, join } from "node:path"
 const USAGE_ENDPOINT = "/api/experimental/usage/limits"
 const CREDENTIAL_ENDPOINT = "/api/credential"
 const CONSOLE_USAGE_ENDPOINT = "/api/usage/summary"
+const SESSION_STATS_ENDPOINT = "/api/experimental/session/stats"
+const ACTIVE_SESSIONS_ENDPOINT = "/api/session/active"
+const PROJECTS_ENDPOINT = "/api/project"
 const MICRO_CENTS_PER_DOLLAR = 100_000_000
 const REQUEST_TIMEOUT_MS = 5_000
 const ACTIVITY_CONCURRENCY = 4
+const PROJECT_CONCURRENCY = 4
 
 type JsonObject = Record<string, unknown>
 
@@ -39,6 +43,86 @@ export type PeriodStats = {
   cost: number
   requests: number
   tokens: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+}
+
+export type TokenUsage = {
+  input: number
+  output: number
+  reasoning: number
+  cache: {
+    read: number
+    write: number
+  }
+}
+
+export type SessionModelUsage = {
+  model: {
+    id: string
+    providerID: string
+    variant: string | undefined
+  }
+  steps: number
+  tokens: TokenUsage
+  cost: number
+}
+
+export type SessionToolUsage = {
+  name: string
+  calls: number
+  succeeded: number
+  failed: number
+  unfinished: number
+  durationP50: number | undefined
+}
+
+export type SessionToolTotals = {
+  calls: number
+  succeeded: number
+  failed: number
+  unfinished: number
+}
+
+export type SessionStats = {
+  range: {
+    from: number
+    to: number
+  }
+  sessions: number
+  subagents: number
+  prompts: number
+  steps: number
+  tokens: TokenUsage
+  cost: number
+  tools: {
+    totals: SessionToolTotals
+    usage: SessionToolUsage[]
+  }
+  activeDays: number
+  streak: number
+  activity: Array<{
+    date: string
+    steps: number
+  }>
+  models: SessionModelUsage[]
+}
+
+export type SessionStatsBundle = {
+  today: SessionStats
+  week: SessionStats
+  month: SessionStats
+  all: SessionStats
+}
+
+export type ProjectUsage = {
+  path: string
+  steps: number
+  tokens: number
+  cost: number
+  sessions: number
 }
 
 export type StatsData = {
@@ -81,9 +165,10 @@ type ConsoleCredential = {
   baseURL: string
 }
 
-type ConsoleUsageQuery =
-  | { range: "24h" }
-  | { from: string; to: string }
+type ConsoleUsageQuery = {
+  from: string
+  to: string
+}
 
 export class UsageError extends Error {
   readonly title: string
@@ -157,7 +242,7 @@ export async function fetchActivity(
   )
 
   const days: ActivityDay[] = dates.map((date, index) => {
-    const stats = summaries[index] ?? { cost: 0, requests: 0, tokens: 0 }
+    const stats = summaries[index] ?? emptyPeriodStats()
     return {
       date,
       day: index + 1,
@@ -187,6 +272,133 @@ export async function fetchActivity(
       tokens: metric((day) => day.tokens),
     },
   }
+}
+
+export async function fetchSessionStatsBundle(
+  config: ServiceConfig,
+  now = Date.now(),
+): Promise<SessionStatsBundle> {
+  const timezone = "UTC"
+  const [today, week, month, all] = await Promise.all([
+    fetchSessionStats(config, {
+      from: startOfUtcDayMs(now),
+      to: now,
+      timezone,
+      tools: "detail",
+    }),
+    fetchSessionStats(config, {
+      from: startOfUtcWeekMs(now),
+      to: now,
+      timezone,
+      tools: "detail",
+    }),
+    fetchSessionStats(config, {
+      from: startOfUtcMonthMs(now),
+      to: now,
+      timezone,
+      tools: "detail",
+    }),
+    fetchSessionStats(config, { timezone, tools: "detail" }),
+  ])
+  return { today, week, month, all }
+}
+
+export async function fetchSessionStats(
+  config: ServiceConfig,
+  query: {
+    from?: number
+    to?: number
+    project?: string
+    timezone?: string
+    tools?: "none" | "summary" | "detail"
+  } = {},
+): Promise<SessionStats> {
+  const params = new URLSearchParams()
+  if (query.from !== undefined) params.set("from", String(query.from))
+  if (query.to !== undefined) params.set("to", String(query.to))
+  if (query.project) params.set("project", query.project)
+  if (query.timezone) params.set("timezone", query.timezone)
+  if (query.tools) params.set("tools", query.tools)
+  const search = params.toString()
+  const body = await requestEndpoint(
+    config,
+    search ? `${SESSION_STATS_ENDPOINT}?${search}` : SESSION_STATS_ENDPOINT,
+    "session stats",
+  )
+  return parseSessionStats(body)
+}
+
+export async function fetchActiveSessions(
+  config: ServiceConfig,
+): Promise<string[]> {
+  const body = await requestEndpoint(
+    config,
+    ACTIVE_SESSIONS_ENDPOINT,
+    "active sessions",
+  )
+  if (!isObject(body) || !isObject(body.data)) return []
+
+  return Object.entries(body.data)
+    .filter(([, value]) => isObject(value) && value.type === "running")
+    .map(([id]) => id)
+}
+
+export async function fetchProjectUsage(
+  config: ServiceConfig,
+  now = Date.now(),
+): Promise<ProjectUsage[]> {
+  const body = await requestEndpoint(config, PROJECTS_ENDPOINT, "projects")
+  const projects = parseProjects(body)
+  if (projects.length === 0) return []
+
+  const from = startOfUtcMonthMs(now)
+  const byPath = new Map<string, ProjectUsage>()
+
+  await mapLimit(projects, PROJECT_CONCURRENCY, async (project) => {
+    let stats: SessionStats
+    try {
+      stats = await fetchSessionStats(config, {
+        from,
+        to: now,
+        project: project.id,
+        timezone: "UTC",
+        tools: "none",
+      })
+    } catch {
+      return
+    }
+
+    const tokens = totalTokens(stats.tokens)
+    const current = byPath.get(project.canonical)
+    if (current) {
+      current.steps += stats.steps
+      current.tokens += tokens
+      current.cost += stats.cost
+      current.sessions += stats.sessions
+    } else {
+      byPath.set(project.canonical, {
+        path: project.canonical,
+        steps: stats.steps,
+        tokens,
+        cost: stats.cost,
+        sessions: stats.sessions,
+      })
+    }
+  })
+
+  return [...byPath.values()]
+    .filter((project) => project.steps > 0)
+    .sort((a, b) => b.steps - a.steps)
+}
+
+export function totalTokens(tokens: TokenUsage): number {
+  return (
+    tokens.input +
+    tokens.output +
+    tokens.reasoning +
+    tokens.cache.read +
+    tokens.cache.write
+  )
 }
 
 async function mapLimit<T, R>(
@@ -221,7 +433,7 @@ function consoleUsageQueries(now: number): {
 } {
   const today = utcDate(now)
   return {
-    today: { range: "24h" },
+    today: { from: today, to: today },
     week: { from: startOfUtcWeek(now), to: today },
     month: { from: startOfUtcMonth(now), to: today },
   }
@@ -277,12 +489,8 @@ async function fetchConsoleSummary(
   query: ConsoleUsageQuery,
 ): Promise<PeriodStats> {
   const params = new URLSearchParams()
-  if ("range" in query) {
-    params.set("range", query.range)
-  } else {
-    params.set("from", query.from)
-    params.set("to", query.to)
-  }
+  params.set("from", query.from)
+  params.set("to", query.to)
   if (credential.userID) params.set("userId", credential.userID)
 
   let response: Response
@@ -559,7 +767,129 @@ function parseConsoleSummary(body: unknown): PeriodStats {
     cost: costMicroCents / MICRO_CENTS_PER_DOLLAR,
     requests,
     tokens: inputTokens + outputTokens + cacheReadTokens + writes,
+    input: inputTokens,
+    output: outputTokens,
+    cacheRead: cacheReadTokens,
+    cacheWrite: writes,
   }
+}
+
+function emptyPeriodStats(): PeriodStats {
+  return {
+    cost: 0,
+    requests: 0,
+    tokens: 0,
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+  }
+}
+
+function parseSessionStats(body: unknown): SessionStats {
+  if (!isObject(body)) throw invalidSessionStatsResponse()
+
+  const data = isObject(body.data) ? body.data : body
+  if (!isObject(data)) throw invalidSessionStatsResponse()
+
+  const range = isObject(data.range) ? data.range : {}
+  const tools = isObject(data.tools) ? data.tools : {}
+  const totals = isObject(tools.totals) ? tools.totals : {}
+  const usage = Array.isArray(tools.usage) ? tools.usage : []
+  const activity = Array.isArray(data.activity) ? data.activity : []
+  const models = Array.isArray(data.models) ? data.models : []
+
+  return {
+    range: {
+      from: numericField(range.from) ?? 0,
+      to: numericField(range.to) ?? 0,
+    },
+    sessions: numericField(data.sessions) ?? 0,
+    subagents: numericField(data.subagents) ?? 0,
+    prompts: numericField(data.prompts) ?? 0,
+    steps: numericField(data.steps) ?? 0,
+    tokens: parseTokenUsage(data.tokens),
+    cost: numericField(data.cost) ?? 0,
+    tools: {
+      totals: {
+        calls: numericField(totals.calls) ?? 0,
+        succeeded: numericField(totals.succeeded) ?? 0,
+        failed: numericField(totals.failed) ?? 0,
+        unfinished: numericField(totals.unfinished) ?? 0,
+      },
+      usage: usage.filter(isObject).map((item) => ({
+        name: stringField(item.name) ?? "unknown",
+        calls: numericField(item.calls) ?? 0,
+        succeeded: numericField(item.succeeded) ?? 0,
+        failed: numericField(item.failed) ?? 0,
+        unfinished: numericField(item.unfinished) ?? 0,
+        durationP50: numberField(item.durationP50),
+      })),
+    },
+    activeDays: numericField(data.activeDays) ?? 0,
+    streak: numericField(data.streak) ?? 0,
+    activity: activity.filter(isObject).map((item) => ({
+      date: stringField(item.date) ?? "",
+      steps: numericField(item.steps) ?? 0,
+    })),
+    models: models.filter(isObject).map(parseSessionModelUsage),
+  }
+}
+
+function parseSessionModelUsage(value: JsonObject): SessionModelUsage {
+  const model = isObject(value.model) ? value.model : {}
+
+  return {
+    model: {
+      id: stringField(model.id) ?? "unknown",
+      providerID: stringField(model.providerID) ?? "unknown",
+      variant: stringField(model.variant),
+    },
+    steps: numericField(value.steps) ?? 0,
+    tokens: parseTokenUsage(value.tokens),
+    cost: numericField(value.cost) ?? 0,
+  }
+}
+
+function parseTokenUsage(value: unknown): TokenUsage {
+  if (!isObject(value)) {
+    return { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+  }
+
+  const cache = isObject(value.cache) ? value.cache : {}
+  return {
+    input: numericField(value.input) ?? 0,
+    output: numericField(value.output) ?? 0,
+    reasoning: numericField(value.reasoning) ?? 0,
+    cache: {
+      read: numericField(cache.read) ?? 0,
+      write: numericField(cache.write) ?? 0,
+    },
+  }
+}
+
+function parseProjects(body: unknown): Array<{ id: string; canonical: string }> {
+  const data = Array.isArray(body)
+    ? body
+    : isObject(body) && Array.isArray(body.data)
+      ? body.data
+      : []
+
+  return data
+    .filter(isObject)
+    .map((item) => ({
+      id: stringField(item.id) ?? "",
+      canonical: stringField(item.canonical) ?? "",
+    }))
+    .filter((item) => item.id.length > 0 && item.canonical.length > 0)
+}
+
+function invalidSessionStatsResponse(): UsageError {
+  return new UsageError(
+    "Unexpected response from OpenCode",
+    "The local session statistics endpoint returned an unexpected shape.",
+    "OpenCode may have changed its experimental API. Update oc-usage or OpenCode, then press r.",
+  )
 }
 
 function consoleResponseError(): UsageError {
@@ -645,21 +975,32 @@ function monthLabel(now: number): string {
   })
 }
 
-function startOfUtcWeek(now: number): string {
+function startOfUtcDayMs(now: number): number {
+  const date = new Date(now)
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
+}
+
+function startOfUtcWeekMs(now: number): number {
   const date = new Date(now)
   const daysSinceMonday = (date.getUTCDay() + 6) % 7
-  return utcDate(
-    Date.UTC(
-      date.getUTCFullYear(),
-      date.getUTCMonth(),
-      date.getUTCDate() - daysSinceMonday,
-    ),
+  return Date.UTC(
+    date.getUTCFullYear(),
+    date.getUTCMonth(),
+    date.getUTCDate() - daysSinceMonday,
   )
 }
 
-function startOfUtcMonth(now: number): string {
+function startOfUtcMonthMs(now: number): number {
   const date = new Date(now)
-  return utcDate(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1))
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1)
+}
+
+function startOfUtcWeek(now: number): string {
+  return utcDate(startOfUtcWeekMs(now))
+}
+
+function startOfUtcMonth(now: number): string {
+  return utcDate(startOfUtcMonthMs(now))
 }
 
 function validateConsoleServer(value: string): string {

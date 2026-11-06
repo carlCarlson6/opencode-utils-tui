@@ -64,6 +64,36 @@ export function formatCost(value: number): string {
   })}`
 }
 
+export function formatCostPerRequest(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "$0.00"
+  if (value < 0.0001) return "<$0.0001"
+  if (value < 0.01) return `$${value.toFixed(4)}`
+  if (value < 1) return `$${value.toFixed(3)}`
+  return `$${value.toFixed(2)}`
+}
+
+export function formatLatency(ms: number | undefined): string {
+  if (ms === undefined || !Number.isFinite(ms) || ms < 0) return "—"
+  if (ms < 1) return "<1ms"
+  if (ms < 1_000) return `${Math.round(ms)}ms`
+  if (ms < 60_000) {
+    const seconds = ms / 1_000
+    return `${seconds.toFixed(1).replace(/\.0$/, "")}s`
+  }
+
+  const totalSeconds = Math.round(ms / 1_000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`
+}
+
+export function projectLabel(path: string): string {
+  const parts = path.split("/").filter(Boolean)
+  if (parts.length === 0) return path || "unknown"
+  if (parts.length === 1) return parts[0] as string
+  return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`
+}
+
 export function formatCount(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0"
   return Math.round(value).toLocaleString("en-US")

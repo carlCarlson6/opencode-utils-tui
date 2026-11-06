@@ -15,14 +15,17 @@ import {
   clampPercent,
   formatAgo,
   formatCost,
+  formatCostPerRequest,
   formatCount,
   formatDuration,
+  formatLatency,
   formatMetricValue,
   formatPercent,
   formatResetClock,
   formatShort,
   formatTokens,
   meterColor,
+  projectLabel,
   remainingPercent,
   renderBar,
   truncateText,
@@ -33,10 +36,22 @@ import type {
   ActivityData,
   Meter,
   PeriodStats,
+  ProjectUsage,
+  SessionStats,
+  SessionStatsBundle,
   StatsData,
   UsageData,
   UsageError,
 } from "./service"
+
+export type InsightsTab =
+  | "activity"
+  | "models"
+  | "tools"
+  | "projects"
+  | "efficiency"
+
+export type InsightPeriod = "today" | "week" | "month"
 
 export type DashboardState = {
   data: UsageData | null
@@ -45,8 +60,15 @@ export type DashboardState = {
   error: UsageError | null
   statsError: UsageError | null
   activityError: UsageError | null
+  sessionStats: SessionStatsBundle | null
+  sessionStatsError: UsageError | null
+  projectUsage: ProjectUsage[] | null
+  projectUsageError: UsageError | null
+  running: number
   metric: Metric
-  showActivity: boolean
+  showInsights: boolean
+  insightsTab: InsightsTab
+  insightsPeriod: InsightPeriod
   lastUpdated: number | null
   loading: boolean
   nextRefreshAt: number
@@ -66,16 +88,29 @@ type MeterCard = {
 
 type StatsPanel = {
   box: BoxRenderable
-  update(stats: StatsData | null, error: UsageError | null): void
+  update(
+    stats: StatsData | null,
+    error: UsageError | null,
+    sessionStats: SessionStatsBundle | null,
+    sessionStatsError: UsageError | null,
+  ): void
   setWidth(width: number): void
 }
 
-type ActivityPanel = {
+type InsightsPanel = {
   box: BoxRenderable
   update(
     activity: ActivityData | null,
-    error: UsageError | null,
+    activityError: UsageError | null,
+    stats: StatsData | null,
+    statsError: UsageError | null,
+    sessionStats: SessionStatsBundle | null,
+    sessionStatsError: UsageError | null,
+    projectUsage: ProjectUsage[] | null,
+    projectUsageError: UsageError | null,
     metric: Metric,
+    tab: InsightsTab,
+    period: InsightPeriod,
   ): void
   setWidth(width: number): void
 }
@@ -99,15 +134,22 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
     error: null,
     statsError: null,
     activityError: null,
+    sessionStats: null,
+    sessionStatsError: null,
+    projectUsage: null,
+    projectUsageError: null,
+    running: 0,
     metric: "cost",
-    showActivity: true,
+    showInsights: true,
+    insightsTab: "activity",
+    insightsPeriod: "month",
     lastUpdated: null,
     loading: true,
     nextRefreshAt: Date.now(),
   }
   let currentWidth = renderer.width
   let currentHeight = renderer.height
-  let activityAttached = false
+  let insightsAttached = false
 
   const root = new BoxRenderable(renderer, {
     id: "dashboard",
@@ -169,14 +211,14 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
   cardsArea.add(cardsRow)
 
   const cards = [
-    createMeterCard(renderer, "5-hour window"),
-    createMeterCard(renderer, "Weekly"),
-    createMeterCard(renderer, "Monthly"),
+    createMeterCard(renderer, "5-hour window", 5 * 3_600_000),
+    createMeterCard(renderer, "Weekly", 7 * 86_400_000),
+    createMeterCard(renderer, "Monthly", 30 * 86_400_000),
   ]
   for (const card of cards) cardsRow.add(card.box)
 
   const statsPanel = createStatsPanel(renderer)
-  const activityPanel = createActivityPanel(renderer)
+  const insightsPanel = createInsightsPanel(renderer)
   cardsArea.add(statsPanel.box)
   root.add(cardsArea)
 
@@ -231,7 +273,7 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
 
     for (const card of cards) card.setWidth(cardWidth)
     statsPanel.setWidth(contentWidth)
-    activityPanel.setWidth(contentWidth)
+    insightsPanel.setWidth(contentWidth)
     renderState()
   }
 
@@ -239,12 +281,12 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
     const state = currentState
     const now = Date.now()
 
-    const showActivity =
-      state.showActivity && currentHeight >= layout.minHeightForActivity
-    if (showActivity !== activityAttached) {
-      if (showActivity) cardsArea.add(activityPanel.box)
-      else cardsArea.remove(activityPanel.box)
-      activityAttached = showActivity
+    const showInsights =
+      state.showInsights && currentHeight >= layout.minHeightForInsights
+    if (showInsights !== insightsAttached) {
+      if (showInsights) cardsArea.add(insightsPanel.box)
+      else cardsArea.remove(insightsPanel.box)
+      insightsAttached = showInsights
     }
 
     const data = state.data
@@ -279,8 +321,25 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
     cards[1]?.update(data?.go.weekly ?? null, now)
     cards[2]?.update(data?.go.monthly ?? null, now)
 
-    statsPanel.update(state.stats, state.statsError)
-    activityPanel.update(state.activity, state.activityError, state.metric)
+    statsPanel.update(
+      state.stats,
+      state.statsError,
+      state.sessionStats,
+      state.sessionStatsError,
+    )
+    insightsPanel.update(
+      state.activity,
+      state.activityError,
+      state.stats,
+      state.statsError,
+      state.sessionStats,
+      state.sessionStatsError,
+      state.projectUsage,
+      state.projectUsageError,
+      state.metric,
+      state.insightsTab,
+      state.insightsPeriod,
+    )
 
     const retrying = error !== null && !state.loading
     const canOpen = Boolean(data?.workspace.usageURL)
@@ -290,18 +349,25 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
       fg(theme.accent)(bold("r")),
       isRetry ? " retry" : " refresh",
     ]
-    if (showActivity) {
+    if (showInsights && state.insightsTab === "activity") {
       keyParts.push(
-        "   ",
+        "  ",
         fg(theme.accent)(bold("m")),
         ` ${state.metric}`,
       )
     }
-    keyParts.push("   ", fg(theme.accent)(bold("g")), " graph")
-    if (canOpen) {
-      keyParts.push("   ", fg(theme.accent)(bold("o")), " console")
+    keyParts.push("  ", fg(theme.accent)(bold("t")), " tab")
+    if (
+      showInsights &&
+      (state.insightsTab === "models" || state.insightsTab === "tools")
+    ) {
+      keyParts.push("  ", fg(theme.accent)(bold("p")), " period")
     }
-    keyParts.push("   ", fg(theme.accent)(bold("q")), " quit")
+    keyParts.push("  ", fg(theme.accent)(bold("g")), " panel")
+    if (canOpen) {
+      keyParts.push("  ", fg(theme.accent)(bold("o")), " console")
+    }
+    keyParts.push("  ", fg(theme.accent)(bold("q")), " quit")
     footerLeft.content = compose(...keyParts)
 
     if (state.loading) {
@@ -355,7 +421,11 @@ export function createDashboard(renderer: CliRenderer): Dashboard {
   return dashboard
 }
 
-function createMeterCard(renderer: CliRenderer, title: string): MeterCard {
+function createMeterCard(
+  renderer: CliRenderer,
+  title: string,
+  windowMs: number,
+): MeterCard {
   let barWidth = 24
 
   const box = new BoxRenderable(renderer, {
@@ -449,10 +519,26 @@ function createMeterCard(renderer: CliRenderer, title: string): MeterCard {
         : Math.round(remainingPercent(meter.percent))
       const usedLabel = meter.limited ? "100%" : formatPercent(meter.percent)
       const color = meterColor(remaining, meter.limited)
+      const pace = meter.limited ? null : paceProjection(meter, windowMs, now)
+      const paceWarning = pace !== null && pace.projected > 100
+      const paceColor =
+        pace !== null && pace.projected >= 150 ? theme.red : theme.amber
 
-      box.title = meter.limited ? ` ${title} · LIMITED ` : ` ${title} `
-      box.titleColor = color
-      box.borderColor = meter.limited ? theme.red : theme.cardBorder
+      box.title = meter.limited
+        ? ` ${title} · LIMITED `
+        : paceWarning && pace
+          ? ` ${title} · ⚠ ${Math.round(pace.projected)}% `
+          : ` ${title} `
+      box.titleColor = meter.limited
+        ? color
+        : paceWarning
+          ? paceColor
+          : color
+      box.borderColor = meter.limited
+        ? theme.red
+        : paceWarning
+          ? paceColor
+          : theme.cardBorder
 
       primaryText.content = `${usedLabel} used`
       primaryText.fg = color
@@ -476,10 +562,29 @@ function createMeterCard(renderer: CliRenderer, title: string): MeterCard {
   }
 }
 
+function paceProjection(
+  meter: Meter,
+  windowMs: number,
+  now: number,
+): { projected: number } | null {
+  if (meter.limited || meter.percent <= 0) return null
+
+  const remainingMs = meter.resetsAt - now
+  if (remainingMs <= 0) return null
+
+  const elapsedMs = windowMs - remainingMs
+  if (elapsedMs <= 0 || elapsedMs < windowMs * 0.05) return null
+
+  const projected = (meter.percent / elapsedMs) * windowMs
+  return { projected }
+}
+
 function createStatsPanel(renderer: CliRenderer): StatsPanel {
   let panelWidth = 78
   let currentStats: StatsData | null = null
   let currentError: UsageError | null = null
+  let currentSessionStats: SessionStatsBundle | null = null
+  let currentSessionStatsError: UsageError | null = null
 
   const box = new BoxRenderable(renderer, {
     id: "stats",
@@ -532,10 +637,37 @@ function createStatsPanel(renderer: CliRenderer): StatsPanel {
     )
   }
 
+  function pulseTitle(): string {
+    const today = currentSessionStats?.today
+    if (!today) return ""
+
+    const parts = [
+      `${formatCount(today.sessions)} sessions`,
+      `${formatCount(today.steps)} steps`,
+      `${formatCount(today.tools.totals.calls)} calls`,
+      `${formatCount(today.tools.totals.failed)} failed`,
+    ]
+    const streak = currentSessionStats?.all.streak ?? 0
+    if (streak > 1) parts.push(`${streak}d streak`)
+
+    const maxLength = Math.max(0, panelWidth - 12)
+    let pulse = ""
+    for (const part of parts) {
+      const next = pulse ? `${pulse} · ${part}` : part
+      if (next.length > maxLength) break
+      pulse = next
+    }
+    return pulse
+  }
+
   function render(): void {
+    const pulse = pulseTitle()
     if (currentError) {
       box.title = currentStats ? " Usage · stale " : " Usage · unavailable "
       box.titleColor = theme.amber
+    } else if (pulse) {
+      box.title = ` Usage · ${pulse} `
+      box.titleColor = currentSessionStatsError ? theme.amber : theme.dim
     } else {
       box.title = " Usage "
       box.titleColor = theme.dim
@@ -586,9 +718,11 @@ function createStatsPanel(renderer: CliRenderer): StatsPanel {
 
   return {
     box,
-    update(stats, error) {
+    update(stats, error, sessionStats, sessionStatsError) {
       currentStats = stats
       currentError = error
+      currentSessionStats = sessionStats
+      currentSessionStatsError = sessionStatsError
       render()
     },
     setWidth(width) {
@@ -598,15 +732,23 @@ function createStatsPanel(renderer: CliRenderer): StatsPanel {
   }
 }
 
-function createActivityPanel(renderer: CliRenderer): ActivityPanel {
+function createInsightsPanel(renderer: CliRenderer): InsightsPanel {
   let panelWidth = 78
   let activity: ActivityData | null = null
-  let error: UsageError | null = null
+  let activityError: UsageError | null = null
+  let stats: StatsData | null = null
+  let statsError: UsageError | null = null
+  let sessionStats: SessionStatsBundle | null = null
+  let sessionStatsError: UsageError | null = null
+  let projectUsage: ProjectUsage[] | null = null
+  let projectUsageError: UsageError | null = null
   let metric: Metric = "cost"
+  let tab: InsightsTab = "activity"
+  let period: InsightPeriod = "month"
 
   const box = new BoxRenderable(renderer, {
-    id: "activity",
-    height: layout.activityHeight,
+    id: "insights",
+    height: layout.insightsHeight,
     flexShrink: 0,
     flexDirection: "column",
     border: true,
@@ -620,8 +762,8 @@ function createActivityPanel(renderer: CliRenderer): ActivityPanel {
     paddingRight: 1,
   })
 
-  const chartRows = Array.from(
-    { length: layout.activityChartHeight },
+  const rows = Array.from(
+    { length: layout.insightsChartHeight },
     () =>
       new TextRenderable(renderer, {
         content: "",
@@ -631,18 +773,39 @@ function createActivityPanel(renderer: CliRenderer): ActivityPanel {
         selectable: false,
       }),
   )
-  for (const row of chartRows) box.add(row)
+  for (const row of rows) box.add(row)
 
-  function render(): void {
+  function clearRows(): void {
+    for (const row of rows) row.content = ""
+  }
+
+  function setTitle(title: string, error: UsageError | null): void {
+    box.title = title
+    box.titleColor = error ? theme.amber : theme.dim
+    box.borderColor = error ? theme.amber : theme.cardBorder
+  }
+
+  function showMessage(message: string): void {
+    clearRows()
+    rows[rows.length - 1]!.content = compose(fg(theme.faint)(message))
+  }
+
+  function periodLabel(value: InsightPeriod): string {
+    if (value === "today") return "Today"
+    if (value === "week") return "This week"
+    return "This month"
+  }
+
+  function renderActivity(): void {
     if (!activity) {
-      box.title = error ? " Activity · unavailable " : " Activity "
-      box.titleColor = error ? theme.amber : theme.dim
-      box.borderColor = error ? theme.amber : theme.cardBorder
-      for (const row of chartRows) row.content = ""
-      chartRows[chartRows.length - 1]!.content = compose(
-        fg(theme.faint)(
-          error ? "Activity history unavailable" : "Waiting for activity history",
-        ),
+      setTitle(
+        activityError ? " Activity · unavailable " : " Activity ",
+        activityError,
+      )
+      showMessage(
+        activityError
+          ? "Activity history unavailable"
+          : "Waiting for activity history",
       )
       return
     }
@@ -679,7 +842,7 @@ function createActivityPanel(renderer: CliRenderer): ActivityPanel {
     for (const value of values) if (value > max) max = value
     if (!(max > 0)) max = 0
 
-    const height = layout.activityChartHeight
+    const height = layout.insightsChartHeight
     const level = (value: number): number => {
       if (!(value > 0) || !(max > 0)) return 0
       return Math.max(1, Math.round((value / max) * height))
@@ -712,32 +875,331 @@ function createActivityPanel(renderer: CliRenderer): ActivityPanel {
       }
       flush()
 
-      chartRows[row]!.content = parts.length > 0 ? compose(...parts) : ""
+      rows[row]!.content = parts.length > 0 ? compose(...parts) : ""
     }
 
     if (!(max > 0)) {
-      chartRows[height - 1]!.content = compose(
+      rows[height - 1]!.content = compose(
         fg(theme.faint)("·".repeat(columns)),
       )
     }
 
     const spent = formatMetricValue(forecast.spent, metric)
     const projected = formatMetricValue(forecast.projected, metric)
-    box.title = ` Activity · ${activity.label} · ${spent} spent · ${projected} forecast${
-      error ? " · stale " : " "
-    }`
-    box.titleColor = error ? theme.amber : theme.dim
-    box.borderColor = error ? theme.amber : theme.cardBorder
+    setTitle(
+      ` Activity · ${activity.label} · ${spent} spent · ${projected} forecast${
+        activityError ? " · stale " : " "
+      }`,
+      activityError,
+    )
+  }
+
+  function renderModels(): void {
+    const data: SessionStats | undefined = sessionStats?.[period]
+    if (!data) {
+      setTitle(
+        ` Models · ${periodLabel(period)} `,
+        sessionStatsError,
+      )
+      showMessage(
+        sessionStatsError
+          ? "Local session stats unavailable"
+          : "Waiting for local session stats",
+      )
+      return
+    }
+
+    const goModels = data.models.filter(
+      (item) => item.model.providerID === "opencode-go" && item.steps > 0,
+    )
+    const pool = (
+      goModels.length > 0
+        ? goModels
+        : data.models.filter((item) => item.steps > 0)
+    ).sort((a, b) => b.steps - a.steps)
+    const scope = goModels.length > 0 ? "Go" : "all providers"
+    const total = pool.reduce((sum, item) => sum + item.steps, 0)
+
+    setTitle(
+      ` Models · ${periodLabel(period)} · ${scope} · ${formatCount(total)} steps${
+        sessionStatsError ? " · stale " : " "
+      }`,
+      sessionStatsError,
+    )
+
+    if (pool.length === 0) {
+      showMessage("No model usage recorded")
+      return
+    }
+
+    const inner = Math.max(1, panelWidth - 4)
+    const labelWidth = Math.min(30, Math.max(15, Math.floor(inner * 0.36)))
+    const countWidth = 7
+    const percentWidth = 5
+    const barWidth = Math.max(
+      8,
+      inner - labelWidth - countWidth - percentWidth - 3,
+    )
+
+    for (let index = 0; index < rows.length; index++) {
+      const item = pool[index]
+      if (!item) continue
+
+      const variant =
+        item.model.variant && item.model.variant !== "default"
+          ? `:${item.model.variant}`
+          : ""
+      const provider = goModels.length > 0 ? "" : `${item.model.providerID}/`
+      const label = truncateText(
+        `${provider}${item.model.id}${variant}`,
+        labelWidth,
+      )
+      const share = total > 0 ? (item.steps / total) * 100 : 0
+
+      rows[index]!.content = compose(
+        fg(theme.text)(label.padEnd(labelWidth)),
+        fg(theme.dim)(formatCount(item.steps).padStart(countWidth)),
+        " ",
+        renderBar(share, barWidth, theme.accent),
+        " ",
+        fg(theme.dim)(`${Math.round(share)}%`.padStart(percentWidth)),
+      )
+    }
+  }
+
+  function renderTools(): void {
+    const data: SessionStats | undefined = sessionStats?.[period]
+    if (!data) {
+      setTitle(
+        ` Tools · ${periodLabel(period)} `,
+        sessionStatsError,
+      )
+      showMessage(
+        sessionStatsError
+          ? "Local session stats unavailable"
+          : "Waiting for local session stats",
+      )
+      return
+    }
+
+    const usage = [...data.tools.usage]
+      .filter((tool) => tool.calls > 0)
+      .sort((a, b) => b.calls - a.calls)
+    const totals = data.tools.totals
+
+    setTitle(
+      ` Tools · ${periodLabel(period)} · ${formatCount(totals.calls)} calls · ${formatCount(
+        totals.failed,
+      )} failed${sessionStatsError ? " · stale " : " "}`,
+      sessionStatsError,
+    )
+
+    if (usage.length === 0) {
+      showMessage("No tool calls recorded")
+      return
+    }
+
+    const inner = Math.max(1, panelWidth - 4)
+    const nameWidth = Math.min(20, Math.max(10, Math.floor(inner * 0.24)))
+    const callsWidth = 8
+    const failedWidth = 10
+    const latencyWidth = 11
+
+    for (let index = 0; index < rows.length; index++) {
+      const tool = usage[index]
+      if (!tool) continue
+
+      const failed = tool.failed > 0 ? `${formatCount(tool.failed)} fail` : "ok"
+      rows[index]!.content = compose(
+        fg(theme.text)(truncateText(tool.name, nameWidth).padEnd(nameWidth)),
+        fg(theme.accent)(formatCount(tool.calls).padStart(callsWidth)),
+        "  ",
+        fg(tool.failed > 0 ? theme.red : theme.dim)(
+          failed.padEnd(failedWidth),
+        ),
+        fg(theme.dim)(
+          `p50 ${formatLatency(tool.durationP50)}`.padStart(latencyWidth),
+        ),
+      )
+    }
+  }
+
+  function renderProjects(): void {
+    if (!projectUsage) {
+      setTitle(" Projects · This month ", projectUsageError)
+      showMessage(
+        projectUsageError
+          ? "Project usage unavailable"
+          : "Waiting for project usage",
+      )
+      return
+    }
+
+    const total = projectUsage.reduce((sum, item) => sum + item.steps, 0)
+    setTitle(
+      ` Projects · This month · ${formatCount(total)} local steps${
+        projectUsageError ? " · stale " : " "
+      }`,
+      projectUsageError,
+    )
+
+    if (projectUsage.length === 0) {
+      showMessage("No project usage recorded")
+      return
+    }
+
+    const inner = Math.max(1, panelWidth - 4)
+    const labelWidth = Math.min(28, Math.max(14, Math.floor(inner * 0.34)))
+    const stepsWidth = 7
+    const percentWidth = 5
+    const barWidth = Math.max(
+      8,
+      inner - labelWidth - stepsWidth - percentWidth - 3,
+    )
+
+    for (let index = 0; index < rows.length; index++) {
+      const project = projectUsage[index]
+      if (!project) continue
+
+      const share = total > 0 ? (project.steps / total) * 100 : 0
+      rows[index]!.content = compose(
+        fg(theme.text)(
+          truncateText(projectLabel(project.path), labelWidth).padEnd(
+            labelWidth,
+          ),
+        ),
+        fg(theme.dim)(formatCount(project.steps).padStart(stepsWidth)),
+        " ",
+        renderBar(share, barWidth, theme.green),
+        " ",
+        fg(theme.dim)(`${Math.round(share)}%`.padStart(percentWidth)),
+      )
+    }
+  }
+
+  function renderEfficiency(): void {
+    const periods = stats
+      ? [stats.today, stats.week, stats.month]
+      : null
+
+    setTitle(
+      ` Efficiency · today / week / month${
+        statsError ? " · stale " : " "
+      }`,
+      statsError,
+    )
+
+    if (!periods) {
+      showMessage(
+        statsError
+          ? "Console usage unavailable"
+          : "Waiting for Console usage",
+      )
+      return
+    }
+
+    const inner = Math.max(1, panelWidth - 4)
+    const labelWidth = Math.min(14, Math.max(10, Math.floor(inner * 0.2)))
+    const gap = 2
+    const columnWidth = Math.max(
+      8,
+      Math.floor((inner - labelWidth - gap * 3) / 3),
+    )
+
+    const rowsData = [
+      {
+        label: "Cache hit",
+        color: theme.green,
+        value: (item: PeriodStats): string => {
+          const total =
+            item.input + item.output + item.cacheRead + item.cacheWrite
+          if (total <= 0) return "--"
+          return `${Math.round((item.cacheRead / total) * 100)}%`
+        },
+      },
+      {
+        label: "$/request",
+        color: theme.accent,
+        value: (item: PeriodStats): string =>
+          item.requests > 0
+            ? formatCostPerRequest(item.cost / item.requests)
+            : "--",
+      },
+      {
+        label: "Tokens/req",
+        color: theme.text,
+        value: (item: PeriodStats): string =>
+          item.requests > 0
+            ? formatTokens(item.tokens / item.requests)
+            : "--",
+      },
+    ]
+
+    for (let index = 0; index < rows.length; index++) {
+      const row = rowsData[index]
+      if (!row) continue
+
+      rows[index]!.content = compose(
+        fg(theme.dim)(row.label.padEnd(labelWidth)),
+        ...periods.map((item) =>
+          fg(statsError ? theme.dim : row.color)(
+            `${row.value(item).padStart(columnWidth)}${" ".repeat(gap)}`,
+          ),
+        ),
+      )
+    }
+  }
+
+  function render(): void {
+    clearRows()
+
+    if (tab === "activity") {
+      renderActivity()
+      return
+    }
+    if (tab === "models") {
+      renderModels()
+      return
+    }
+    if (tab === "tools") {
+      renderTools()
+      return
+    }
+    if (tab === "projects") {
+      renderProjects()
+      return
+    }
+    renderEfficiency()
   }
 
   render()
 
   return {
     box,
-    update(nextActivity, nextError, nextMetric) {
+    update(
+      nextActivity,
+      nextActivityError,
+      nextStats,
+      nextStatsError,
+      nextSessionStats,
+      nextSessionStatsError,
+      nextProjectUsage,
+      nextProjectUsageError,
+      nextMetric,
+      nextTab,
+      nextPeriod,
+    ) {
       activity = nextActivity
-      error = nextError
+      activityError = nextActivityError
+      stats = nextStats
+      statsError = nextStatsError
+      sessionStats = nextSessionStats
+      sessionStatsError = nextSessionStatsError
+      projectUsage = nextProjectUsage
+      projectUsageError = nextProjectUsageError
       metric = nextMetric
+      tab = nextTab
+      period = nextPeriod
       render()
     },
     setWidth(width) {
@@ -872,13 +1334,22 @@ function headerStatus(
   }
 
   const mainColor = offline ? theme.red : stale ? theme.amber : theme.dim
+  const parts: Array<TextChunk | StyledText> = []
 
-  if (!limited) return [fg(mainColor)(main)]
-  return [
-    fg(theme.red)(bold("LIMITED")),
-    fg(theme.dim)(" · "),
-    fg(mainColor)(main),
-  ]
+  if (state.running > 0) {
+    parts.push(
+      fg(theme.green)(`● ${state.running} running`),
+      fg(theme.dim)(" · "),
+    )
+  }
+  if (limited) {
+    parts.push(
+      fg(theme.red)(bold("LIMITED")),
+      fg(theme.dim)(" · "),
+    )
+  }
+  parts.push(fg(mainColor)(main))
+  return parts
 }
 
 function errorColor(error: UsageError): string {
